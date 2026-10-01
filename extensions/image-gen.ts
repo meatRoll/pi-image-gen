@@ -18,12 +18,12 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import type { AgentToolResult, AgentToolUpdateCallback } from "@mariozechner/pi-agent-core";
-import { Container, fuzzyFilter, getEditorKeybindings, Input, Spacer, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-import type { Static } from "@sinclair/typebox";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import { Container, fuzzyFilter, Input, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import type { Static } from "typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
 
 // ── Image Model Registry ───────────────────────────────────────────
@@ -844,14 +844,13 @@ export default function piImageGen(pi: ExtensionAPI) {
         return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
       });
 
-      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, _kb, done) => {
+      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, kb, done) => {
         const searchInput = new Input();
         searchInput.focused = true;
         const listContainer = new Container();
         const previewText = new Text("", 1, 0);
         let filteredModels = sortedModels;
         let selectedIndex = 0;
-        const kb = getEditorKeybindings();
 
         // Thin border that spans viewport width, matching Pi's DynamicBorder
         const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
@@ -928,19 +927,19 @@ export default function piImageGen(pi: ExtensionAPI) {
           render(width: number) { return container.render(width); },
           invalidate() { container.invalidate(); },
           handleInput(data: string) {
-            if (kb.matches(data, "selectUp")) {
+            if (kb.matches(data, "tui.select.up")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "selectDown")) {
+            } else if (kb.matches(data, "tui.select.down")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "selectConfirm")) {
+            } else if (kb.matches(data, "tui.select.confirm")) {
               if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
-            } else if (kb.matches(data, "selectCancel")) {
+            } else if (kb.matches(data, "tui.select.cancel")) {
               done(undefined);
             } else {
               searchInput.handleInput(data);
