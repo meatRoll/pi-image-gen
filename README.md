@@ -82,6 +82,7 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json` (global) or `
       "baseUrl": "http://192.168.1.51:9999/v1",
       "apiKey": "MY_API_KEY",
       "api": "openai-images",
+      "responseFormat": "b64_json",
       "models": [
         {
           "id": "my-local-image-model",
@@ -94,7 +95,8 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json` (global) or `
 }
 ```
 
-### Supported API Types
+For providers whose signed image URLs require server-side authentication, set `responseFormat` to `b64_json`. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request to the provider.
+
 
 | Type | Used By | Endpoint |
 |------|---------|----------|

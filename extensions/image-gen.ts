@@ -14,17 +14,20 @@
  *   google-generative-ai-image — POST generateContent with responseModalities (Google)
  */
 
-import { randomUUID } from "node:crypto";
+import { randomUUID, createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import { join } from "node:path";
-import { getAgentDir } from "@earendil-works/pi-coding-agent";
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import { Container, fuzzyFilter, Input, Spacer, Text } from "@earendil-works/pi-tui";
-import { Type } from "typebox";
-import type { Static } from "typebox";
+import { tmpdir } from "node:os";
+import { getAgentDir } from "@mariozechner/pi-coding-agent";
+import { Container, fuzzyFilter, getEditorKeybindings, Input, Spacer, Text } from "@mariozechner/pi-tui";
+import { Type } from "@sinclair/typebox";
+import type { Static } from "@sinclair/typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
+
+const execFileAsync = promisify(execFile);
 
 // ── Image Model Registry ───────────────────────────────────────────
 // Mirrors Pi's ModelRegistry: built-in + custom, with provider-aware lookups.
@@ -74,6 +77,8 @@ interface ExtensionConfig {
   /** Image provider definitions. Each key is a provider name; value defines
    *  baseUrl, apiKey, api type, and models. Highest-priority model source. */
   providers?: Record<string, ModelsJsonImageProviderConfig>;
+  /** Proxy used by curl when downloading signed Gemini image URLs locally. */
+  downloadProxy?: string;
 }
 
 function readJsonFile(path: string): Record<string, unknown> {
@@ -153,6 +158,8 @@ interface ModelsJsonImageProviderConfig {
   baseUrl?: string;
   apiKey?: string;
   api?: ImageApi;
+  /** OpenAI Images response format. Use b64_json when the server owns signed-media authentication. */
+  responseFormat?: "url" | "b64_json";
   models?: ModelsJsonImageModelDef[];
 }
 
@@ -437,6 +444,8 @@ async function saveImageToDisk(base64Data: string, mimeType: string, outputDir: 
 interface ProviderConfig {
   apiKey: string;
   baseUrl: string;
+  downloadProxy?: string;
+  responseFormat?: "url" | "b64_json";
 }
 
 async function resolveProviderConfig(
@@ -471,7 +480,12 @@ async function resolveProviderConfig(
     throw new Error(`No base URL for provider "${imageModel.provider}".`);
   }
 
-  return { apiKey, baseUrl };
+  return {
+    apiKey,
+    baseUrl,
+    downloadProxy: config.downloadProxy,
+    responseFormat: config.providers?.[imageModel.provider]?.responseFormat,
+  };
 }
 
 // ── Image Generation by API Type ───────────────────────────────────
@@ -492,6 +506,127 @@ const OPENAI_SIZES: Record<string, string> = {
   "2:3": "1024x1536",
 };
 
+async function downloadGeminiImageLocally(
+  rawUrl: string,
+  proxy: string | undefined,
+  signal?: AbortSignal,
+): Promise<GeneratedImage> {
+  const debugUrlFile = process.env.PI_IMAGE_DEBUG_URL_FILE;
+  if (debugUrlFile) {
+    await writeFile(debugUrlFile, rawUrl, { encoding: "utf8", mode: 0o600 });
+  }
+  const allowedHosts = new Set([
+    "lh3.googleusercontent.com",
+    "lh3.google.com",
+    "work.fife.usercontent.google.com",
+  ]);
+  const validateUrl = (value: string): URL => {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "https:" || !allowedHosts.has(parsed.hostname)) {
+      throw new Error("Gemini image URL host is not allowed");
+    }
+    return parsed;
+  };
+  const withWebVariant = (value: string): string => {
+    const parsed = validateUrl(value);
+    if ((parsed.pathname.startsWith("/gg/") || parsed.pathname.startsWith("/gg-dl/"))
+        && !parsed.pathname.split("/").pop()?.includes("=")) {
+      parsed.pathname += "=d-I";
+    }
+    parsed.searchParams.set("alr", "yes");
+    return parsed.toString();
+  };
+  const parseHeaders = (text: string): { status: number; contentType: string; location?: string } => {
+    const blocks = text.split(/\r?\n\r?\n/).filter(Boolean);
+    const block = blocks.at(-1) || text;
+    const statusMatch = block.match(/^HTTP\/\S+\s+(\d+)/m);
+    if (!statusMatch) throw new Error("curl returned no HTTP status");
+    const headerMap = new Map<string, string>();
+    for (const line of block.split(/\r?\n/).slice(1)) {
+      const separator = line.indexOf(":");
+      if (separator > 0) headerMap.set(line.slice(0, separator).toLowerCase(), line.slice(separator + 1).trim());
+    }
+    return {
+      status: Number(statusMatch[1]),
+      contentType: (headerMap.get("content-type") || "").split(";", 1)[0].toLowerCase(),
+      location: headerMap.get("location"),
+    };
+  };
+
+  const directory = await mkdtemp(join(tmpdir(), "pi-image-gen-"));
+  const cookieJarPath = join(directory, "cookies.txt");
+  let current = withWebVariant(rawUrl);
+  try {
+    for (let hop = 0; hop <= 3; hop += 1) {
+      const headerPath = join(directory, "headers");
+      const bodyPath = join(directory, "body");
+      const requestHost = new URL(current).hostname;
+      const sameSiteMediator = requestHost.endsWith(".usercontent.google.com");
+      const fetchSite = sameSiteMediator ? "same-site" : "cross-site";
+      const args = [
+        "--silent", "--show-error", "--http2", "--compressed", "--max-time", "90", "--connect-timeout", "20",
+        "--dump-header", headerPath, "--output", bodyPath,
+        "--cookie", cookieJarPath, "--cookie-jar", cookieJarPath,
+        "-H", "accept: */*",
+        "-H", "accept-language: zh-CN,zh;q=0.9,en;q=0.8,ja;q=0.7",
+        "-H", "cache-control: no-cache",
+        "-H", "origin: https://gemini.google.com",
+        "-H", "pragma: no-cache",
+        "-H", "referer: https://gemini.google.com/",
+        "-H", "priority: u=1, i",
+        "-H", "sec-ch-ua: \"Google Chrome\";v=\"155\", \"Chromium\";v=\"155\", \"Not(A:Brand\";v=\"24\"",
+        "-H", "sec-ch-ua-arch: \"arm\"",
+        "-H", "sec-ch-ua-bitness: \"64\"",
+        "-H", "sec-ch-ua-form-factors: \"Desktop\"",
+        "-H", "sec-ch-ua-full-version: \"155.0.8059.80\"",
+        "-H", "sec-ch-ua-full-version-list: \"Google Chrome\";v=\"155.0.8059.80\", \"Chromium\";v=\"155.0.8059.80\", \"Not(A:Brand\";v=\"24.0.0.0\"",
+        "-H", "sec-ch-ua-mobile: ?0",
+        "-H", "sec-ch-ua-model: \"\"",
+        "-H", "sec-ch-ua-platform: \"macOS\"",
+        "-H", "sec-ch-ua-platform-version: \"15.3.2\"",
+        "-H", "sec-ch-ua-wow64: ?0",
+        "-H", "sec-fetch-dest: empty",
+        "-H", "sec-fetch-mode: cors",
+        "-H", `sec-fetch-site: ${fetchSite}`,
+        ...(sameSiteMediator ? [] : ["-H", "sec-fetch-storage-access: active"]),
+        "-H", "x-browser-channel: stable",
+        "-H", "x-browser-copyright: Copyright 2026 Google LLC. All Rights Reserved.",
+        "-H", "x-browser-validation: YXjt/if5gRhK4M5qXvb22nUeBck=",
+        "-H", "x-browser-year: 2026",
+        "-H", "x-client-data: CKmdygEIlaHLAQiGoM0B",
+        "-H", "user-agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/155.0.8059.80 Safari/537.36",
+      ];
+      if (proxy) args.push("--proxy", proxy);
+      args.push("--url", current);
+      await execFileAsync("curl", args, { signal, maxBuffer: 1024 * 1024 });
+      const result = parseHeaders(await readFile(headerPath, "utf8"));
+      const body = await readFile(bodyPath);
+      const currentUrl = new URL(current);
+      const pathHash = createHash("sha256").update(currentUrl.pathname).digest("hex").slice(0, 12);
+      console.error(
+        `[pi-image-gen] download hop=${hop} host=${currentUrl.hostname} path_len=${currentUrl.pathname.length} path_sha256=${pathHash} status=${result.status} mime=${result.contentType || "-"} bytes=${body.length}`,
+      );
+      if (result.status >= 300 && result.status < 400 && result.location) {
+        current = withWebVariant(new URL(result.location, current).toString());
+        continue;
+      }
+      if (result.status !== 200) throw new Error(`Gemini image download failed (${result.status})`);
+      if (result.contentType === "image/jpeg" || result.contentType === "image/png" || result.contentType === "image/webp") {
+        return { data: body.toString("base64"), mimeType: result.contentType };
+      }
+      if (result.contentType === "text/plain") {
+        const nextUrl = body.toString("utf8").trim();
+        current = withWebVariant(nextUrl);
+        continue;
+      }
+      throw new Error(`Gemini image download returned ${result.contentType || "unknown content"}`);
+    }
+    throw new Error("Gemini image download exceeded hop limit");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
 /** OpenAI /v1/images/generations endpoint */
 async function generateViaOpenAIImages(
   config: ProviderConfig,
@@ -507,7 +642,7 @@ async function generateViaOpenAIImages(
     prompt,
     n: 1,
     size,
-    response_format: "b64_json",
+    response_format: config.responseFormat || "url",
   };
   if (model.id === "gpt-image-1") body.quality = quality;
   if (model.id === "dall-e-3") body.quality = quality === "high" ? "hd" : "standard";
@@ -527,10 +662,23 @@ async function generateViaOpenAIImages(
     throw new Error(`OpenAI image generation failed (${response.status}): ${errorText}`);
   }
 
-  const result = (await response.json()) as { data: Array<{ b64_json?: string }> };
-  if (!result.data[0]?.b64_json) throw new Error("OpenAI returned no image data");
-
-  return { data: result.data[0].b64_json, mimeType: "image/png" };
+  const result = (await response.json()) as { data: Array<{ b64_json?: string; url?: string }> };
+  if (result.data[0]?.b64_json) {
+    const encoded = result.data[0].b64_json;
+    const bytes = Buffer.from(encoded, "base64");
+    let mimeType = "image/png";
+    if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) mimeType = "image/jpeg";
+    else if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) mimeType = "image/png";
+    else if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") mimeType = "image/webp";
+    return { data: encoded, mimeType };
+  }
+    const imageUrl = result.data[0]?.url;
+    if (imageUrl) {
+      const dataUrl = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(imageUrl);
+      if (dataUrl) return { data: dataUrl[2], mimeType: dataUrl[1] };
+      return downloadGeminiImageLocally(imageUrl, config.downloadProxy, signal);
+    }
+  throw new Error("OpenAI returned no image data");
 }
 
 /** OpenRouter chat completions with image output.
@@ -769,7 +917,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       }
     }
     if (!sessionSelection) {
-      const config = loadConfig(ctx.cwd || process.cwd());
+      const config = loadConfig(ctx.cwd);
       if (config.defaultProvider && config.defaultModel) {
         sessionSelection = { provider: config.defaultProvider, model: config.defaultModel };
       }
@@ -844,13 +992,14 @@ export default function piImageGen(pi: ExtensionAPI) {
         return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
       });
 
-      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, kb, done) => {
+      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, _kb, done) => {
         const searchInput = new Input();
         searchInput.focused = true;
         const listContainer = new Container();
         const previewText = new Text("", 1, 0);
         let filteredModels = sortedModels;
         let selectedIndex = 0;
+        const kb = getEditorKeybindings();
 
         // Thin border that spans viewport width, matching Pi's DynamicBorder
         const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
@@ -927,19 +1076,19 @@ export default function piImageGen(pi: ExtensionAPI) {
           render(width: number) { return container.render(width); },
           invalidate() { container.invalidate(); },
           handleInput(data: string) {
-            if (kb.matches(data, "tui.select.up")) {
+            if (kb.matches(data, "selectUp")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "tui.select.down")) {
+            } else if (kb.matches(data, "selectDown")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "tui.select.confirm")) {
+            } else if (kb.matches(data, "selectConfirm")) {
               if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
-            } else if (kb.matches(data, "tui.select.cancel")) {
+            } else if (kb.matches(data, "selectCancel")) {
               done(undefined);
             } else {
               searchInput.handleInput(data);
