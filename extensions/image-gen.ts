@@ -25,7 +25,7 @@ import { tmpdir } from "node:os";
 import { getAgentDir, convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import { Container, fuzzyFilter, getCapabilities, getKeybindings, hyperlink, Input, Spacer, Text } from "@earendil-works/pi-tui";
+import { Container, fuzzyFilter, getCapabilities, getKeybindings, hyperlink, Image, Input, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
@@ -1220,7 +1220,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       };
     },
 
-    renderResult(result, _options, theme) {
+    renderResult(result, _options, theme, context) {
       const text = result.content.find((block) => block.type === "text")?.text || "";
       const details = (result.details || {}) as {
         provider?: string;
@@ -1231,24 +1231,43 @@ export default function piImageGen(pi: ExtensionAPI) {
         downloadUrl?: string;
       };
 
-      // Partial updates and save failures use the tool's plain text result.
-      if (!details.savedPath || !details.downloadUrl) {
-        return new Text(theme.fg("toolOutput", text), 0, 0);
-      }
-
       const lines = [
         theme.fg(
           "toolOutput",
           `Generated image with ${details.provider || "unknown"}/${details.model || "unknown"} (${details.api || "unknown"}). ` +
             `Aspect ratio: ${details.aspectRatio || "1:1"}.`,
         ),
-        theme.fg("toolOutput", `Saved locally to: ${details.savedPath}`),
+        theme.fg("toolOutput", `Saved locally to: ${details.savedPath || "(save failed)"}`),
       ];
-      const linkText = getCapabilities().hyperlinks
-        ? hyperlink(`Download image: ${details.savedPath}`, details.downloadUrl)
-        : `Download link: ${details.downloadUrl}`;
-      lines.push(theme.fg("accent", linkText));
-      return new Text(lines.join("\n"), 0, 0);
+      if (details.downloadUrl) {
+        const linkText = getCapabilities().hyperlinks
+          ? hyperlink(`Download image: ${details.savedPath || details.downloadUrl}`, details.downloadUrl)
+          : `Download link: ${details.downloadUrl}`;
+        lines.push(theme.fg("accent", linkText));
+      } else if (text) {
+        lines.push(theme.fg("error", text));
+      }
+
+      const container = new Container();
+      container.addChild(new Text(lines.join("\n"), 0, 0));
+
+      // Pi normally renders image content after renderResult. Keep an explicit
+      // fallback for sessions that have inline images disabled in their global
+      // renderer, while the image block remains available to the model.
+      const image = result.content.find((block) => block.type === "image");
+      if (image?.type === "image" && !context.showImages && getCapabilities().images) {
+        container.addChild(new Spacer(1));
+        container.addChild(
+          new Image(
+            image.data,
+            image.mimeType,
+            { fallbackColor: (value) => theme.fg("toolOutput", value) },
+            { maxWidthCells: 60 },
+          ),
+        );
+      }
+
+      return container;
     },
   });
 }
