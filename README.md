@@ -112,12 +112,16 @@ Model-level `api` overrides provider-level `api`.
 
 ## Save Modes
 
+Images are always saved locally so every result includes a reusable file path and download link. The default location is the project directory.
+
 | Mode | Location |
 |------|----------|
-| `none` | Don't save (default) |
-| `project` | `<repo>/.pi/generated-images/` |
+| `project` | `<repo>/.pi/generated-images/` (default) |
 | `global` | `~/.pi/agent/generated-images/` |
-| `custom` | `saveDir` param or `PI_IMAGE_SAVE_DIR` |
+| `custom` | `saveDir` param or `saveDir` in config |
+| `none` | Legacy value; falls back to `project` |
+
+The TUI result shows the absolute local path and a clickable `Download image` link when the terminal supports OSC 8 hyperlinks. In terminals without hyperlink support, it shows the `file://` URL as text.
 
 ## Tool Parameters
 
@@ -129,7 +133,7 @@ The `generate_image` tool accepts:
 | `aspectRatio` | string | `1:1` | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
 | `imageSize` | string | `1K` | `1K`, `2K`, `4K` (OpenRouter models only) |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
-| `save` | string | `none` | `none`, `project`, `global`, `custom` |
+| `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |
 | `timeout` | number | `600` | Generation timeout in seconds |
 

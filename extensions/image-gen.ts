@@ -20,11 +20,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
+import { pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { getAgentDir } from "@mariozechner/pi-coding-agent";
-import { Container, fuzzyFilter, getEditorKeybindings, Input, Spacer, Text } from "@mariozechner/pi-tui";
-import { Type } from "@sinclair/typebox";
-import type { Static } from "@sinclair/typebox";
+import { getAgentDir, convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import { Container, fuzzyFilter, getCapabilities, getKeybindings, hyperlink, Input, Spacer, Text } from "@earendil-works/pi-tui";
+import { Type } from "typebox";
+import type { Static } from "typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
 
 const execFileAsync = promisify(execFile);
@@ -62,7 +65,7 @@ function getModelsForProvider(provider: string): ImageModel[] {
 
 // ── Config ─────────────────────────────────────────────────────────
 
-const SAVE_MODES = ["none", "project", "global", "custom"] as const;
+const SAVE_MODES = ["project", "global", "custom"] as const;
 type SaveMode = (typeof SAVE_MODES)[number];
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
@@ -96,8 +99,14 @@ function globalConfigPath(): string {
 
 function loadConfig(cwd: string): ExtensionConfig {
   const globalConfig = readJsonFile(globalConfigPath());
-  const projectConfig = readJsonFile(join(getAgentDir(), "settings", "pi-image-gen.json"));
-  return { ...globalConfig, ...projectConfig } as ExtensionConfig;
+  const projectConfig = readJsonFile(join(cwd, ".pi", "settings", "pi-image-gen.json"));
+  const globalProviders = (globalConfig.providers || {}) as Record<string, unknown>;
+  const projectProviders = (projectConfig.providers || {}) as Record<string, unknown>;
+  return {
+    ...globalConfig,
+    ...projectConfig,
+    providers: { ...globalProviders, ...projectProviders },
+  } as ExtensionConfig;
 }
 
 /** Persist model selection to global config so it survives across sessions. */
@@ -379,27 +388,25 @@ function getSettingsImageModels(config: ExtensionConfig): ImageModel[] {
   return [...models.values()];
 }
 
-/** Merge all model sources: built-in → discovered → models.json → settings providers */
+/** Merge model sources, with explicit settings acting as the catalog override. */
 function getAllModels(config: ExtensionConfig): ImageModel[] {
+  const configuredModels = getSettingsImageModels(config);
+  if (configuredModels.length > 0) return configuredModels;
+
   const models = new Map<string, ImageModel>();
 
-  // 1. Built-in generated models (lowest priority)
+  // Built-in generated models (lowest priority)
   for (const m of getBuiltInModels()) {
     models.set(`${m.provider}/${m.id}`, m);
   }
 
-  // 2. Runtime-discovered models
+  // Runtime-discovered models
   for (const m of discoveredModels) {
     models.set(`${m.provider}/${m.id}`, m);
   }
 
-  // 3. Pi's models.json — legacy output:["image"] entries
+  // Pi's models.json — legacy output:["image"] entries
   for (const m of getModelsJsonImageModels()) {
-    models.set(`${m.provider}/${m.id}`, m);
-  }
-
-  // 4. Settings providers (highest priority)
-  for (const m of getSettingsImageModels(config)) {
     models.set(`${m.provider}/${m.id}`, m);
   }
 
@@ -409,7 +416,9 @@ function getAllModels(config: ExtensionConfig): ImageModel[] {
 // ── Save Logic ─────────────────────────────────────────────────────
 
 function resolveSaveConfig(save: string | undefined, saveDir: string | undefined, cwd: string, config: ExtensionConfig): { mode: SaveMode; outputDir?: string } {
-  const mode = (save || config.save || "none") as SaveMode;
+  // Images are always persisted locally. Legacy save=none falls back to project storage.
+  const requestedMode = save || config.save;
+  const mode: SaveMode = requestedMode === "global" || requestedMode === "custom" ? requestedMode : "project";
 
   if (mode === "project") return { mode, outputDir: join(cwd, ".pi", "generated-images") };
   if (mode === "global") return { mode, outputDir: join(getAgentDir(), "generated-images") };
@@ -418,7 +427,7 @@ function resolveSaveConfig(save: string | undefined, saveDir: string | undefined
     if (!dir?.trim()) throw new Error("save=custom requires saveDir parameter or saveDir in config.");
     return { mode, outputDir: dir };
   }
-  return { mode: "none" };
+  throw new Error(`Unsupported save mode: ${String(requestedMode)}`);
 }
 
 function imageExtension(mimeType: string): string {
@@ -493,6 +502,27 @@ async function resolveProviderConfig(
 interface GeneratedImage {
   data: string;       // base64
   mimeType: string;
+}
+
+/**
+ * Match Pi's read-tool image path: resize large results and normalize the
+ * returned attachment to PNG so Kitty terminals do not depend on a later
+ * asynchronous JPEG/WebP transcoder inside the TUI.
+ */
+async function prepareImageForTui(image: GeneratedImage): Promise<GeneratedImage> {
+  try {
+    const resized = await resizeImage(
+      new Uint8Array(Buffer.from(image.data, "base64")),
+      image.mimeType,
+      { maxWidth: 1200, maxHeight: 1200, maxBytes: 2 * 1024 * 1024 },
+    );
+    if (!resized) return image;
+    const png = await convertToPng(resized.data, resized.mimeType);
+    return png || { data: resized.data, mimeType: resized.mimeType };
+  } catch {
+    // Keep the original provider result available if local image processing fails.
+    return image;
+  }
 }
 
 // OpenAI size mapping from aspect ratios
@@ -887,7 +917,7 @@ const TOOL_PARAMS = Type.Object({
     description: "Image quality: auto (default), low, medium, high. OpenAI direct only.",
   })),
   save: Type.Optional(Type.String({
-    description: "Save mode: none, project, global, custom. Default: none.",
+    description: "Save mode: project (default), global, or custom. Images are always saved locally.",
   })),
   saveDir: Type.Optional(Type.String({
     description: "Directory to save image when save=custom.",
@@ -999,7 +1029,7 @@ export default function piImageGen(pi: ExtensionAPI) {
         const previewText = new Text("", 1, 0);
         let filteredModels = sortedModels;
         let selectedIndex = 0;
-        const kb = getEditorKeybindings();
+        const kb = getKeybindings();
 
         // Thin border that spans viewport width, matching Pi's DynamicBorder
         const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
@@ -1076,19 +1106,19 @@ export default function piImageGen(pi: ExtensionAPI) {
           render(width: number) { return container.render(width); },
           invalidate() { container.invalidate(); },
           handleInput(data: string) {
-            if (kb.matches(data, "selectUp")) {
+            if (kb.matches(data, "tui.select.up")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "selectDown")) {
+            } else if (kb.matches(data, "tui.select.down")) {
               if (filteredModels.length === 0) return;
               selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
               updateList();
               updatePreview();
-            } else if (kb.matches(data, "selectConfirm")) {
+            } else if (kb.matches(data, "tui.select.confirm")) {
               if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
-            } else if (kb.matches(data, "selectCancel")) {
+            } else if (kb.matches(data, "tui.select.cancel")) {
               done(undefined);
             } else {
               searchInput.handleInput(data);
@@ -1115,7 +1145,7 @@ export default function piImageGen(pi: ExtensionAPI) {
     name: "generate_image",
     label: "Generate image",
     description:
-      "Generate an image from a text prompt. Uses the model selected via /image-model. " +
+      "Generate an image from a text prompt. Uses the selected image model, which is independent of Pi's current text model. " +
       "Do NOT pass provider or model parameters — just provide the prompt.",
     parameters: TOOL_PARAMS,
 
@@ -1146,12 +1176,13 @@ export default function piImageGen(pi: ExtensionAPI) {
 
       const providerConfig = await resolveProviderConfig(imageModel, ctx, config);
       const image = await generateImage(providerConfig, imageModel, params.prompt, aspectRatio, imageSize, quality, combinedSignal);
+      const displayImage = await prepareImageForTui(image);
 
-      // Save if configured
+      // Always save a local copy so the result can expose a stable path and file link.
       const saveConfig = resolveSaveConfig(params.save, params.saveDir, ctx.cwd, config);
       let savedPath: string | undefined;
       let saveError: string | undefined;
-      if (saveConfig.mode !== "none" && saveConfig.outputDir) {
+      if (saveConfig.outputDir) {
         try {
           savedPath = await saveImageToDisk(image.data, image.mimeType, saveConfig.outputDir);
         } catch (error) {
@@ -1159,17 +1190,21 @@ export default function piImageGen(pi: ExtensionAPI) {
         }
       }
 
+      const downloadUrl = savedPath ? pathToFileURL(savedPath).href : undefined;
       const summary: string[] = [
-        `Generated image.`,
+        `Generated image with ${imageModel.provider}/${imageModel.id} (${imageModel.api}).`,
         `Aspect ratio: ${aspectRatio}.`,
       ];
-      if (savedPath) summary.push(`Saved to: ${savedPath}`);
-      if (saveError) summary.push(`Save failed: ${saveError}`);
+      if (savedPath) {
+        summary.push(`Saved locally to: ${savedPath}`);
+        summary.push(`Download link: ${downloadUrl}`);
+      }
+      if (saveError) summary.push(`Local save failed: ${saveError}`);
 
       return {
         content: [
           { type: "text", text: summary.join(" ") },
-          { type: "image", data: image.data, mimeType: image.mimeType },
+          { type: "image", data: displayImage.data, mimeType: displayImage.mimeType },
         ],
         details: {
           provider: imageModel.provider,
@@ -1178,9 +1213,42 @@ export default function piImageGen(pi: ExtensionAPI) {
           aspectRatio,
           quality,
           savedPath,
+          downloadUrl,
+          saveError,
           saveMode: saveConfig.mode,
         },
       };
+    },
+
+    renderResult(result, _options, theme) {
+      const text = result.content.find((block) => block.type === "text")?.text || "";
+      const details = (result.details || {}) as {
+        provider?: string;
+        model?: string;
+        api?: string;
+        aspectRatio?: string;
+        savedPath?: string;
+        downloadUrl?: string;
+      };
+
+      // Partial updates and save failures use the tool's plain text result.
+      if (!details.savedPath || !details.downloadUrl) {
+        return new Text(theme.fg("toolOutput", text), 0, 0);
+      }
+
+      const lines = [
+        theme.fg(
+          "toolOutput",
+          `Generated image with ${details.provider || "unknown"}/${details.model || "unknown"} (${details.api || "unknown"}). ` +
+            `Aspect ratio: ${details.aspectRatio || "1:1"}.`,
+        ),
+        theme.fg("toolOutput", `Saved locally to: ${details.savedPath}`),
+      ];
+      const linkText = getCapabilities().hyperlinks
+        ? hyperlink(`Download image: ${details.savedPath}`, details.downloadUrl)
+        : `Download link: ${details.downloadUrl}`;
+      lines.push(theme.fg("accent", linkText));
+      return new Text(lines.join("\n"), 0, 0);
     },
   });
 }
