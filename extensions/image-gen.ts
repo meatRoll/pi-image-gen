@@ -448,6 +448,21 @@ async function saveImageToDisk(base64Data: string, mimeType: string, outputDir: 
   return filePath;
 }
 
+/**
+ * Models often turn a file:// URL from the tool result into a bare absolute
+ * path in their final Markdown response. OSC 8 needs a URL scheme for
+ * terminals such as iTerm2 to open the target with Command-click.
+ */
+function normalizeLocalMarkdownLinks(text: string): string {
+  let normalized = text.replace(/\]\(<(\/[^>\r\n]+)>\)/g, (_match, rawPath: string) =>
+    `](${pathToFileURL(rawPath).href})`,
+  );
+  normalized = normalized.replace(/\]\((\/[^)\r\n]+)\)/g, (_match, rawPath: string) =>
+    `](${pathToFileURL(rawPath).href})`,
+  );
+  return normalized;
+}
+
 // ── Provider Config Resolution ─────────────────────────────────────
 
 interface ProviderConfig {
@@ -934,8 +949,25 @@ type ToolParams = Static<typeof TOOL_PARAMS>;
 export default function piImageGen(pi: ExtensionAPI) {
   let sessionSelection: ModelSelection | null = null;
 
-  // ── Restore state from session ──
+  // Models sometimes rewrite the tool's file:// URL as a bare absolute path
+  // in their final Markdown answer. Normalize it before Pi renders and saves
+  // the assistant message so OSC 8 and Command-click receive a real file URL.
+  pi.on("message_end", (event) => {
+    if (event.message.role !== "assistant") return;
 
+    let changed = false;
+    const content = event.message.content.map((block) => {
+      if (block.type !== "text") return block;
+      const text = normalizeLocalMarkdownLinks(block.text);
+      if (text === block.text) return block;
+      changed = true;
+      return { ...block, text };
+    });
+
+    if (changed) return { message: { ...event.message, content } };
+  });
+
+  // ── Restore state from session ──
   pi.on("session_start", async (_event, ctx) => {
     // Restore session model selection from branch entries, then fall back to saved config
     for (const entry of ctx.sessionManager.getBranch()) {
