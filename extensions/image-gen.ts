@@ -9,7 +9,7 @@
  * - Session-persisted selection via pi.appendEntry()
  *
  * API types:
- *   openai-images           — POST /v1/images/generations (OpenAI direct)
+ *   openai-images           — POST /v1/images/generations or /v1/images/edits (OpenAI direct)
  *   openai-chat-image       — POST /v1/chat/completions with image output (OpenRouter)
  *   google-generative-ai-image — POST generateContent with responseModalities (Google)
  */
@@ -19,8 +19,8 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { join, basename, isAbsolute, resolve } from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { getAgentDir, convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -519,6 +519,61 @@ interface GeneratedImage {
   mimeType: string;
 }
 
+interface InputImage {
+  data: Buffer;
+  filename: string;
+  mimeType: string;
+}
+
+function resolveInputImagePath(inputPath: string, cwd: string): string {
+  const trimmed = inputPath.trim();
+  if (!trimmed) throw new Error("Image path cannot be empty.");
+  if (trimmed.startsWith("file://")) return fileURLToPath(trimmed);
+  return isAbsolute(trimmed) ? trimmed : resolve(cwd, trimmed);
+}
+
+function detectInputImageMimeType(data: Buffer, filePath: string): string {
+  if (data.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "image/png";
+  }
+  if (data.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) {
+    return "image/jpeg";
+  }
+  if (data.subarray(0, 4).toString("ascii") === "RIFF" && data.subarray(8, 12).toString("ascii") === "WEBP") {
+    return "image/webp";
+  }
+
+  const lowerPath = filePath.toLowerCase();
+  if (lowerPath.endsWith(".png")) return "image/png";
+  if (lowerPath.endsWith(".jpg") || lowerPath.endsWith(".jpeg")) return "image/jpeg";
+  if (lowerPath.endsWith(".webp")) return "image/webp";
+  throw new Error(`Unsupported image format for "${filePath}". Use PNG, JPEG, or WebP.`);
+}
+
+async function loadInputImage(inputPath: string, cwd: string, label: string): Promise<InputImage> {
+  const resolvedPath = resolveInputImagePath(inputPath, cwd);
+  let data: Buffer;
+  try {
+    data = await readFile(resolvedPath);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Cannot read ${label} "${resolvedPath}": ${detail}`);
+  }
+  if (data.length === 0) throw new Error(`${label} "${resolvedPath}" is empty.`);
+
+  return {
+    data,
+    filename: basename(resolvedPath),
+    mimeType: detectInputImageMimeType(data, resolvedPath),
+  };
+}
+
+function imageBlob(image: InputImage): Blob {
+  const bytes = new Uint8Array(new ArrayBuffer(image.data.length));
+  bytes.set(image.data);
+  return new Blob([bytes.buffer], { type: image.mimeType });
+}
+
 /**
  * Match Pi's read-tool image path: resize large results and normalize the
  * returned attachment to PNG so Kitty terminals do not depend on a later
@@ -672,39 +727,67 @@ async function downloadGeminiImageLocally(
   }
 }
 
-/** OpenAI /v1/images/generations endpoint */
+function isGptImageModel(modelId: string): boolean {
+  return modelId.startsWith("gpt-image-") || modelId === "chatgpt-image-latest";
+}
+
+/** OpenAI /v1/images/generations and /v1/images/edits endpoints */
 async function generateViaOpenAIImages(
   config: ProviderConfig,
   model: ImageModel,
   prompt: string,
   aspectRatio: string,
   quality: string,
+  inputImage?: InputImage,
+  maskImage?: InputImage,
   signal?: AbortSignal,
 ): Promise<GeneratedImage> {
   const size = OPENAI_SIZES[aspectRatio] || "1024x1024";
-  const body: Record<string, unknown> = {
-    model: model.id,
-    prompt,
-    n: 1,
-    size,
-    response_format: config.responseFormat || "url",
+  const operation = inputImage ? "image edit" : "image generation";
+  const endpoint = inputImage ? "edits" : "generations";
+  const headers: Record<string, string> = {
+    Authorization: `Bearer ${config.apiKey}`,
   };
-  if (model.id === "gpt-image-1") body.quality = quality;
-  if (model.id === "dall-e-3") body.quality = quality === "high" ? "hd" : "standard";
+  let requestBody: string | FormData;
 
-  const response = await fetch(`${config.baseUrl}/images/generations`, {
+  if (inputImage) {
+    const form = new FormData();
+    form.append("model", model.id);
+    form.append("prompt", prompt);
+    form.append("n", "1");
+    form.append("size", size);
+    if (!isGptImageModel(model.id)) form.append("response_format", config.responseFormat || "url");
+    if (isGptImageModel(model.id)) form.append("quality", quality);
+    if (model.id === "dall-e-3") form.append("quality", quality === "high" ? "hd" : "standard");
+    form.append("image", imageBlob(inputImage), inputImage.filename);
+    if (maskImage) {
+      form.append("mask", imageBlob(maskImage), maskImage.filename);
+    }
+    requestBody = form;
+  } else {
+    const body: Record<string, unknown> = {
+      model: model.id,
+      prompt,
+      n: 1,
+      size,
+    };
+    if (!isGptImageModel(model.id)) body.response_format = config.responseFormat || "url";
+    if (isGptImageModel(model.id)) body.quality = quality;
+    if (model.id === "dall-e-3") body.quality = quality === "high" ? "hd" : "standard";
+    headers["Content-Type"] = "application/json";
+    requestBody = JSON.stringify(body);
+  }
+
+  const response = await fetch(`${config.baseUrl}/images/${endpoint}`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
+    headers,
+    body: requestBody,
     signal,
   });
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`OpenAI image generation failed (${response.status}): ${errorText}`);
+    throw new Error(`OpenAI ${operation} failed (${response.status}): ${errorText}`);
   }
 
   const result = (await response.json()) as { data: Array<{ b64_json?: string; url?: string }> };
@@ -717,13 +800,14 @@ async function generateViaOpenAIImages(
     else if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") mimeType = "image/webp";
     return { data: encoded, mimeType };
   }
-    const imageUrl = result.data[0]?.url;
-    if (imageUrl) {
-      const dataUrl = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(imageUrl);
-      if (dataUrl) return { data: dataUrl[2], mimeType: dataUrl[1] };
-      return downloadGeminiImageLocally(imageUrl, config.downloadProxy, signal);
-    }
-  throw new Error("OpenAI returned no image data");
+  const imageUrl = result.data[0]?.url;
+  if (imageUrl) {
+    const dataUrl = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(imageUrl);
+    if (dataUrl) return { data: dataUrl[2], mimeType: dataUrl[1] };
+
+    return downloadGeminiImageLocally(imageUrl, config.downloadProxy, signal);
+  }
+  throw new Error(`OpenAI ${operation} returned no image data`);
 }
 
 /** OpenRouter chat completions with image output.
@@ -851,7 +935,7 @@ async function generateViaGoogleImage(
   throw new Error("Google returned no image data");
 }
 
-/** Route to the appropriate generation method based on model's API type */
+/** Route to the appropriate generation or edit method based on model's API type */
 async function generateImage(
   config: ProviderConfig,
   model: ImageModel,
@@ -859,11 +943,19 @@ async function generateImage(
   aspectRatio: string,
   imageSize: string,
   quality: string,
+  inputImage?: InputImage,
+  maskImage?: InputImage,
   signal?: AbortSignal,
 ): Promise<GeneratedImage> {
+  if (inputImage && model.api !== "openai-images") {
+    throw new Error(
+      `Image editing currently requires a model configured with api: "openai-images"; "${model.api}" does not expose /images/edits.`,
+    );
+  }
+
   switch (model.api) {
     case "openai-images":
-      return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, signal);
+      return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, inputImage, maskImage, signal);
     case "openai-chat-image":
       return generateViaChatImage(config, model, prompt, aspectRatio, imageSize, signal);
     case "google-generative-ai-image":
@@ -921,7 +1013,13 @@ const SESSION_ENTRY_TYPE = "pi-image-gen:model-select";
 // ── Tool Parameters ────────────────────────────────────────────────
 
 const TOOL_PARAMS = Type.Object({
-  prompt: Type.String({ description: "Description of the image to generate." }),
+  prompt: Type.String({ description: "Description of the image to generate or edit." }),
+  imagePath: Type.Optional(Type.String({
+    description: "Local path (or file:// URL) of an input image for image-to-image editing. Requires an openai-images model.",
+  })),
+  maskPath: Type.Optional(Type.String({
+    description: "Optional local path (or file:// URL) of a mask image for local editing. Requires imagePath.",
+  })),
   aspectRatio: Type.Optional(Type.String({
     description: "Aspect ratio: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.",
   })),
@@ -1177,8 +1275,8 @@ export default function piImageGen(pi: ExtensionAPI) {
     name: "generate_image",
     label: "Generate image",
     description:
-      "Generate an image from a text prompt. Uses the selected image model, which is independent of Pi's current text model. " +
-      "Do NOT pass provider or model parameters — just provide the prompt.",
+      "Generate an image from a text prompt, or edit a local input image when imagePath is supplied. Uses the selected image model, which is independent of Pi's current text model. " +
+      "Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
     parameters: TOOL_PARAMS,
 
     async execute(
@@ -1194,6 +1292,23 @@ export default function piImageGen(pi: ExtensionAPI) {
       const imageSize = params.imageSize || "1K";
       const quality = params.quality || "auto";
 
+      const hasEditInput = Boolean(params.imagePath || params.maskPath);
+      if (params.maskPath && !params.imagePath) {
+        throw new Error("maskPath requires imagePath.");
+      }
+      if (hasEditInput && imageModel.api !== "openai-images") {
+        throw new Error(
+          `Image editing currently requires an openai-images model; selected ${imageModel.provider}/${imageModel.id} uses ${imageModel.api}.`,
+        );
+      }
+      const inputImage = params.imagePath
+        ? await loadInputImage(params.imagePath, ctx.cwd, "input image")
+        : undefined;
+      const maskImage = params.maskPath
+        ? await loadInputImage(params.maskPath, ctx.cwd, "mask image")
+        : undefined;
+      const action = inputImage ? "Editing image" : "Generating image";
+
       // Build a combined signal: framework abort + configured timeout
       const timeoutMs = (params.timeout ?? config.timeout ?? DEFAULT_TIMEOUT_MS / 1000) * 1000;
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
@@ -1202,12 +1317,22 @@ export default function piImageGen(pi: ExtensionAPI) {
         : timeoutSignal;
 
       onUpdate?.({
-        content: [{ type: "text", text: `Generating image with ${imageModel.provider}/${imageModel.id}...` }],
+        content: [{ type: "text", text: `${action} with ${imageModel.provider}/${imageModel.id}...` }],
         details: { provider: imageModel.provider, model: imageModel.id, api: imageModel.api },
       });
 
       const providerConfig = await resolveProviderConfig(imageModel, ctx, config);
-      const image = await generateImage(providerConfig, imageModel, params.prompt, aspectRatio, imageSize, quality, combinedSignal);
+      const image = await generateImage(
+        providerConfig,
+        imageModel,
+        params.prompt,
+        aspectRatio,
+        imageSize,
+        quality,
+        inputImage,
+        maskImage,
+        combinedSignal,
+      );
       const displayImage = await prepareImageForTui(image);
 
       // Always save a local copy so the result can expose a stable path and file link.
@@ -1224,9 +1349,10 @@ export default function piImageGen(pi: ExtensionAPI) {
 
       const downloadUrl = savedPath ? pathToFileURL(savedPath).href : undefined;
       const summary: string[] = [
-        `Generated image with ${imageModel.provider}/${imageModel.id} (${imageModel.api}).`,
+        `${inputImage ? "Edited" : "Generated"} image with ${imageModel.provider}/${imageModel.id} (${imageModel.api}).`,
         `Aspect ratio: ${aspectRatio}.`,
       ];
+      if (inputImage) summary.push(`Input image: ${inputImage.filename}.`);
       if (savedPath) {
         summary.push(`Saved locally to: ${savedPath}`);
         summary.push(`Download link: ${downloadUrl}`);
@@ -1242,8 +1368,11 @@ export default function piImageGen(pi: ExtensionAPI) {
           provider: imageModel.provider,
           model: imageModel.id,
           api: imageModel.api,
+          operation: inputImage ? "edit" : "generate",
           aspectRatio,
           quality,
+          imagePath: params.imagePath,
+          maskPath: params.maskPath,
           savedPath,
           downloadUrl,
           saveError,

@@ -37,6 +37,16 @@ Just ask the agent to generate an image:
 > Make me a logo for a coffee shop, save it to the project
 ```
 
+### Image-to-image editing
+
+Pass a local image path through `imagePath` to edit an existing image. With an `openai-images` model, the extension sends a `multipart/form-data` request to `/v1/images/edits`. Pass `maskPath` when the provider should restrict the edit to a masked region.
+
+```text
+> Edit `/tmp/source.png` into a watercolor illustration while preserving the composition.
+```
+
+The selected model must use the `openai-images` API type for image editing. OpenRouter chat-image and Google models continue to support text-to-image generation through their existing APIs.
+
 ### Choosing a Model
 
 Use `/image-model` — works in both Pi terminal and Minapi:
@@ -55,7 +65,7 @@ Models are auto-generated from OpenRouter's API and static catalogs. Run `npm ru
 
 | Provider | Models | API Key | API Type |
 |----------|--------|---------|----------|
-| **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` |
+| **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` and `/v1/images/edits` |
 | **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | Gemini `generateContent` |
 | **openrouter** | `openai/gpt-5-image`, `openai/gpt-5-image-mini`, `google/gemini-2.5-flash-image`, `google/gemini-3-pro-image-preview`, FLUX.2 variants, Seedream, Riverflow, and more | `OPENROUTER_API_KEY` | Chat completions |
 
@@ -100,7 +110,7 @@ For providers whose signed image URLs require server-side authentication, set `r
 
 | Type | Used By | Endpoint |
 |------|---------|----------|
-| `openai-images` | OpenAI direct | `POST /v1/images/generations` |
+| `openai-images` | OpenAI direct | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
 | `openai-chat-image` | OpenRouter | `POST /v1/chat/completions` with `modalities: ["image"]` |
 | `google-generative-ai-image` | Google Gemini | `POST /models/{id}:generateContent` |
 
@@ -129,7 +139,9 @@ The `generate_image` tool accepts:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | *required* | Description of the image to generate |
+| `prompt` | string | *required* | Description of the image to generate or edit |
+| `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model |
+| `maskPath` | string | — | Optional local mask path or `file://` URL for localized edits; requires `imagePath` |
 | `aspectRatio` | string | `1:1` | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
 | `imageSize` | string | `1K` | `1K`, `2K`, `4K` (OpenRouter models only) |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
@@ -142,6 +154,7 @@ The `generate_image` tool accepts:
 - **API keys** — Resolved via `ctx.modelRegistry.getApiKeyForProvider()` (env vars, auth.json, OAuth)
 - **Base URLs** — From model data, settings providers, or Pi's registry
 - **Custom providers** — Define in `~/.pi/agent/settings/pi-image-gen.json`
+- **Image edits** — Use `imagePath` and optional `maskPath` with a provider configured as `openai-images`
 
 ## Architecture
 
