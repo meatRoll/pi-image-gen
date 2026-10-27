@@ -1,5 +1,5 @@
 {
-  "name": "@ssweens/pi-image-gen",
+  "name": "@meatroll/pi-image-gen",
   "version": "1.0.0",
   "type": "module",
   "description": "Provider-agnostic image generation for Pi coding agent",

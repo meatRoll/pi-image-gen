@@ -3,7 +3,7 @@
 ![pi-image-gen model selector](screenshot.png)
 
 ```bash
-pi install @ssweens/pi-image-gen
+pi install @meatroll/pi-image-gen
 ```
 
 Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool and `/image-model` selector. Supports OpenAI, Google, and OpenRouter providers, with runtime discovery of new models from OpenRouter.
@@ -20,7 +20,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 ## Install
 
 ```bash
-pi install npm:@ssweens/pi-image-gen
+pi install npm:@meatroll/pi-image-gen
 # or from local path
 pi install /path/to/pi-image-gen
 ```
