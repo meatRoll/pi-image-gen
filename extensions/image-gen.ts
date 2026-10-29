@@ -19,13 +19,21 @@ import { existsSync, readFileSync, statSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { join, basename, isAbsolute, resolve } from "node:path";
+import { join, basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
 import { getAgentDir, convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import { Container, fuzzyFilter, getKeybindings, Input, Spacer, Text } from "@earendil-works/pi-tui";
+import {
+  Container,
+  fuzzyFilter,
+  getImageDimensions,
+  getKeybindings,
+  Input,
+  Spacer,
+  Text,
+} from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
@@ -574,6 +582,68 @@ function imageBlob(image: InputImage): Blob {
   return new Blob([bytes.buffer], { type: image.mimeType });
 }
 
+function inputImageDimensions(inputImage: InputImage): { widthPx: number; heightPx: number } {
+  const dimensions = getImageDimensions(inputImage.data.toString("base64"), inputImage.mimeType);
+  if (!dimensions || dimensions.widthPx < 1 || dimensions.heightPx < 1) {
+    throw new Error(`Cannot determine dimensions for "${inputImage.filename}".`);
+  }
+  return dimensions;
+}
+
+async function nextMaskPath(cwd: string, config: ExtensionConfig): Promise<string> {
+  const saveConfig = resolveSaveConfig(undefined, undefined, cwd, config);
+  const outputDir = saveConfig.outputDir || join(cwd, ".pi", "generated-images");
+  await mkdir(outputDir, { recursive: true });
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  return join(outputDir, `mask-${timestamp}-${randomUUID().slice(0, 8)}.png`);
+}
+
+/**
+ * Launch the internal browser canvas selector and wait for the user to draw
+ * freehand lasso shapes. The helper prints the generated mask path on stdout.
+ * The browser canvas gives pixel-level precision and also works in terminals
+ * without inline-image support.
+ */
+async function selectMaskWithBrowser(
+  imagePath: string,
+  cwd: string,
+  config: ExtensionConfig,
+  timeoutSeconds: number,
+  signal?: AbortSignal,
+): Promise<string | "canceled"> {
+  const helperPath = join(dirname(fileURLToPath(import.meta.url)), "..", "lib", "mask-selector.mjs");
+  if (!existsSync(helperPath)) {
+    throw new Error(`Browser mask helper not found at ${helperPath}. Reinstall the package.`);
+  }
+
+  const seconds = Math.max(1, Math.floor(timeoutSeconds));
+  const maskPath = await nextMaskPath(cwd, config);
+  try {
+    const { stdout } = await execFileAsync(
+      process.execPath,
+      [helperPath, imagePath, "-o", maskPath, "--timeout", String(seconds)],
+      {
+        signal,
+        timeout: (seconds + 10) * 1000,
+        maxBuffer: 1024 * 1024,
+      },
+    );
+    const output = stdout.trim().split(/\r?\n/).filter(Boolean).at(-1);
+    return output || maskPath;
+  } catch (error) {
+    const stderr = typeof (error as { stderr?: unknown })?.stderr === "string"
+      ? (error as { stderr: string }).stderr.trim()
+      : "";
+    const detail = `${error instanceof Error ? error.message : String(error)}${stderr ? `\n${stderr}` : ""}`;
+    if (/Selection canceled/i.test(detail)) return "canceled";
+    if (error instanceof Error && (
+      error.name === "AbortError"
+      || (error as NodeJS.ErrnoException).code === "ABORT_ERR"
+    )) throw error;
+    throw new Error(`Browser mask selector failed: ${detail}`);
+  }
+}
+
 /**
  * Match Pi's read-tool image path: resize large results and normalize the
  * returned attachment to PNG so Kitty terminals do not depend on a later
@@ -605,6 +675,24 @@ const OPENAI_SIZES: Record<string, string> = {
   "3:2": "1536x1024",
   "2:3": "1024x1536",
 };
+
+/** Pick the supported ratio closest to the source image when editing. */
+function closestAspectRatio(inputImage: InputImage): string {
+  const { widthPx, heightPx } = inputImageDimensions(inputImage);
+  const target = widthPx / heightPx;
+  let bestRatio = "1:1";
+  let bestDistance = Infinity;
+  for (const ratio of Object.keys(OPENAI_SIZES)) {
+    const [width, height] = ratio.split(":").map(Number);
+    if (!width || !height) continue;
+    const distance = Math.abs(Math.log((width / height) / target));
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      bestRatio = ratio;
+    }
+  }
+  return bestRatio;
+}
 
 async function downloadGeminiImageLocally(
   rawUrl: string,
@@ -1013,15 +1101,15 @@ const SESSION_ENTRY_TYPE = "pi-image-gen:model-select";
 // ── Tool Parameters ────────────────────────────────────────────────
 
 const TOOL_PARAMS = Type.Object({
-  prompt: Type.String({ description: "Description of the image to generate or edit." }),
+  prompt: Type.String({ description: "Description of the image to generate or edit. After a region is selected, this is offered as the suggested prompt; the user can accept it or write a custom prompt." }),
   imagePath: Type.Optional(Type.String({
-    description: "Local path (or file:// URL) of an input image for image-to-image editing. Requires an openai-images model.",
+    description: "Local path (or file:// URL) of an input image for image-to-image editing. Requires an openai-images model. In interactive TUI mode, omit maskPath and the tool will ask whether to launch a region selector first.",
   })),
   maskPath: Type.Optional(Type.String({
-    description: "Optional local path (or file:// URL) of a mask image for local editing. Requires imagePath.",
+    description: "Optional prepared mask image for local editing. Requires imagePath. Omit this to be asked whether to select an area interactively.",
   })),
   aspectRatio: Type.Optional(Type.String({
-    description: "Aspect ratio: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9.",
+    description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. For edits, defaults to the input image's nearest supported ratio.",
   })),
   imageSize: Type.Optional(Type.String({
     description: "Image resolution: 1K (1024x1024, default), 2K, 4K. OpenRouter models only.",
@@ -1276,7 +1364,8 @@ export default function piImageGen(pi: ExtensionAPI) {
     label: "Generate image",
     description:
       "Generate an image from a text prompt, or edit a local input image when imagePath is supplied. Uses the selected image model, which is independent of Pi's current text model. " +
-      "Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
+      "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. After a mask is selected, the user chooses to use the suggested prompt or write a custom one from a blank editor. " +
+      "Pass maskPath only when a mask was already prepared. Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
     parameters: TOOL_PARAMS,
 
     async execute(
@@ -1288,9 +1377,10 @@ export default function piImageGen(pi: ExtensionAPI) {
     ): Promise<AgentToolResult<unknown>> {
       const config = loadConfig(ctx.cwd);
       const imageModel = resolveModel(sessionSelection, config);
-      const aspectRatio = params.aspectRatio || "1:1";
+      let aspectRatio = params.aspectRatio || "1:1";
       const imageSize = params.imageSize || "1K";
       const quality = params.quality || "auto";
+      let prompt = params.prompt;
 
       const hasEditInput = Boolean(params.imagePath || params.maskPath);
       if (params.maskPath && !params.imagePath) {
@@ -1301,13 +1391,113 @@ export default function piImageGen(pi: ExtensionAPI) {
           `Image editing currently requires an openai-images model; selected ${imageModel.provider}/${imageModel.id} uses ${imageModel.api}.`,
         );
       }
-      const inputImage = params.imagePath
-        ? await loadInputImage(params.imagePath, ctx.cwd, "input image")
+      const inputPath = params.imagePath ? resolveInputImagePath(params.imagePath, ctx.cwd) : undefined;
+      const inputImage = inputPath
+        ? await loadInputImage(inputPath, ctx.cwd, "input image")
         : undefined;
-      const maskImage = params.maskPath
+      if (inputImage && !params.aspectRatio) {
+        aspectRatio = closestAspectRatio(inputImage);
+      }
+      let maskImage = params.maskPath
         ? await loadInputImage(params.maskPath, ctx.cwd, "mask image")
         : undefined;
-      const action = inputImage ? "Editing image" : "Generating image";
+      let generatedMaskPath: string | undefined;
+      let editScope: "provided" | "region" | "whole" | "none" = params.maskPath ? "provided" : "none";
+      let editFallback: string | undefined;
+      let maskSource: "provided" | "browser" | undefined = params.maskPath ? "provided" : undefined;
+      const canceledEdit = (message = "Image edit canceled: no edit area was selected."): AgentToolResult<unknown> => ({
+        content: [{ type: "text", text: message }],
+        details: { canceled: true, operation: "edit", imagePath: params.imagePath },
+      });
+
+      // Editing with no explicit mask should not edit silently and should not
+      // launch a selector without consent. Ask first, then open the
+      // pixel-precise browser tool if the user wants a region.
+      if (inputImage && inputPath && !params.maskPath) {
+        if (ctx.mode === "tui") {
+          const browserChoice = "Launch browser mask tool (freehand lasso)";
+          const wholeChoice = "Edit whole image";
+          const cancelChoice = "Cancel";
+          const choices = [browserChoice, wholeChoice, cancelChoice];
+          const choice = await ctx.ui.select("Select an edit area?", choices);
+          if (!choice || choice === cancelChoice) return canceledEdit();
+
+          if (choice === browserChoice) {
+            ctx.ui.notify("Opening browser mask selector…", "info");
+            const selectedMask = await selectMaskWithBrowser(
+              inputPath,
+              ctx.cwd,
+              config,
+              params.timeout ?? config.timeout ?? DEFAULT_TIMEOUT_MS / 1000,
+              signal,
+            );
+            if (selectedMask === "canceled") return canceledEdit();
+            generatedMaskPath = selectedMask;
+            maskImage = await loadInputImage(selectedMask, ctx.cwd, "mask image");
+            editScope = "region";
+            maskSource = "browser";
+          } else {
+            editScope = "whole";
+          }
+        } else {
+          editScope = "whole";
+          editFallback = "Interactive image selection requires TUI mode; editing the entire image.";
+        }
+      }
+
+      // After the user has drawn a mask, let them either accept the agent's
+      // suggested prompt or start from a blank editor. Never prefill the custom
+      // editor: clearing a long suggestion should not be part of the flow.
+      if (editScope === "region" && generatedMaskPath) {
+        const suggestedPrompt = params.prompt.trim();
+        const askForCustomPrompt = async (): Promise<string | undefined> => {
+          const title = "Write a custom prompt for the selected area";
+          let editedPrompt = await ctx.ui.editor(title, "");
+          while (editedPrompt !== undefined && !editedPrompt.trim()) {
+            ctx.ui.notify("Edit prompt cannot be empty.", "warning");
+            editedPrompt = await ctx.ui.editor(title, "");
+          }
+          return editedPrompt?.trim();
+        };
+
+        if (suggestedPrompt) {
+          const preview = suggestedPrompt.replace(/\s+/g, " ").trim();
+          const previewLabel = preview.length > 90 ? `${preview.slice(0, 87)}...` : preview;
+          const useSuggested = `Use suggested prompt — ${previewLabel}`;
+          const writeCustom = "Write a custom prompt";
+          const cancelPrompt = "Cancel";
+          const promptChoice = await ctx.ui.select(
+            "Edit prompt for the selected area",
+            [useSuggested, writeCustom, cancelPrompt],
+          );
+          if (!promptChoice || promptChoice === cancelPrompt) {
+            return canceledEdit("Image edit canceled: prompt entry was canceled.");
+          }
+          if (promptChoice === writeCustom) {
+            const customPrompt = await askForCustomPrompt();
+            if (customPrompt === undefined) {
+              return canceledEdit("Image edit canceled: prompt entry was canceled.");
+            }
+            prompt = customPrompt;
+          } else {
+            prompt = suggestedPrompt;
+          }
+        } else {
+          const customPrompt = await askForCustomPrompt();
+          if (customPrompt === undefined) {
+            return canceledEdit("Image edit canceled: prompt entry was canceled.");
+          }
+          prompt = customPrompt;
+        }
+      }
+
+      const action = inputImage
+        ? editScope === "region"
+          ? "Editing selected area"
+          : editScope === "provided"
+            ? "Editing masked area"
+            : "Editing entire image"
+        : "Generating image";
 
       // Build a combined signal: framework abort + configured timeout
       const timeoutMs = (params.timeout ?? config.timeout ?? DEFAULT_TIMEOUT_MS / 1000) * 1000;
@@ -1325,7 +1515,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       const image = await generateImage(
         providerConfig,
         imageModel,
-        params.prompt,
+        prompt,
         aspectRatio,
         imageSize,
         quality,
@@ -1353,6 +1543,16 @@ export default function piImageGen(pi: ExtensionAPI) {
         `Aspect ratio: ${aspectRatio}.`,
       ];
       if (inputImage) summary.push(`Input image: ${inputImage.filename}.`);
+      if (maskSource === "browser") {
+        summary.push("Edit area: browser-selected mask.");
+      } else if (editScope === "whole" && !params.maskPath) {
+        summary.push("Edit area: entire image.");
+      } else if (params.maskPath) {
+        summary.push(`Mask: ${params.maskPath}.`);
+      }
+      if (editScope === "region") summary.push(`Edit prompt: ${prompt}`);
+      if (generatedMaskPath) summary.push(`Generated mask: ${generatedMaskPath}.`);
+      if (editFallback) summary.push(editFallback);
       if (savedPath) {
         summary.push(`Saved locally to: ${savedPath}`);
         summary.push(`Download link: ${downloadUrl}`);
@@ -1372,7 +1572,12 @@ export default function piImageGen(pi: ExtensionAPI) {
           aspectRatio,
           quality,
           imagePath: params.imagePath,
-          maskPath: params.maskPath,
+          maskPath: generatedMaskPath ?? params.maskPath,
+          maskSource,
+          editScope: inputImage ? editScope : undefined,
+          prompt,
+          promptEdited: prompt !== params.prompt,
+          fallbackReason: editFallback,
           savedPath,
           downloadUrl,
           saveError,

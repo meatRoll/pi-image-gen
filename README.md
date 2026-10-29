@@ -6,7 +6,7 @@
 pi install @meatroll/pi-image-gen
 ```
 
-Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool and `/image-model` selector. Supports OpenAI, Google, and OpenRouter providers, with runtime discovery of new models from OpenRouter.
+Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports OpenAI, Google, and OpenRouter providers, with runtime discovery of new models from OpenRouter.
 
 ## Features
 
@@ -16,6 +16,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 - 🖼️ **Aspect ratios & quality** — 1:1, 16:9, 9:16, 4:3, etc. with quality controls
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
 - 🎯 **`/image-model` command** — Interactive fuzzy-search model picker with session persistence
+- 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, choose the suggested prompt or write a custom one
 
 ## Install
 
@@ -39,13 +40,42 @@ Just ask the agent to generate an image:
 
 ### Image-to-image editing
 
-Pass a local image path through `imagePath` to edit an existing image. With an `openai-images` model, the extension sends a `multipart/form-data` request to `/v1/images/edits`. Pass `maskPath` when the provider should restrict the edit to a masked region.
+Pass a local image path through `imagePath` to edit an existing image. With an `openai-images` model, the extension sends a `multipart/form-data` request to `/v1/images/edits`.
+
+In interactive Pi TUI mode, leave `maskPath` out. The extension first asks **“Select an edit area?”** and only launches a selector after you choose one:
+
+- **Launch browser mask tool (freehand lasso)** — opens a local browser canvas where you draw freehand lasso shapes around any area at source-pixel precision. Multiple areas, undo, and clear are supported.
+- **Edit whole image** — skip the mask and edit the full image.
+- **Cancel** — abort without calling the image API.
+
+After a region is saved, Pi asks whether to use the suggested prompt or write a custom one. Custom prompts start in a blank multi-line editor, so there is nothing to delete. Press Enter to confirm, Shift+Enter for a newline, or Escape to cancel.
 
 ```text
 > Edit `/tmp/source.png` into a watercolor illustration while preserving the composition.
 ```
 
+The selected region(s) are converted to a PNG mask automatically and saved under `.pi/generated-images/`. In non-TUI or headless mode, omitting `maskPath` edits the whole image. Pass `maskPath` only when a mask has already been prepared. For edits, the output aspect ratio defaults to the input image's nearest supported ratio unless `aspectRatio` is set explicitly.
+
 The selected model must use the `openai-images` API type for image editing. OpenRouter chat-image and Google models continue to support text-to-image generation through their existing APIs.
+
+### Browser mask selector
+
+The interactive edit flow can launch a local browser canvas for freehand lasso selection. It does not depend on Pi's terminal-cell resolution and supports multiple shapes, undo, and clear at source-pixel precision.
+
+Drag to draw a loop around each area; release to close and fill it. Press Enter to save the mask or Escape to clear the current selection. After saving, Pi asks whether to use the suggested prompt or write a custom one. The selector attempts to close its browser tab automatically; if the browser blocks script-initiated tab closing, it shows a fallback message instead.
+
+The helper binds only to `127.0.0.1`, writes the mask under `.pi/generated-images/`, and returns its path to Pi. Transparent pixels are the editable region; opaque pixels are preserved.
+
+#### Browser selector service lifecycle
+
+The local HTTP service starts only when the browser selector is actually launched. It is not started at Pi startup.
+
+- **Start** — `generate_image` spawns `lib/mask-selector.mjs` after you choose the browser mask tool. The helper binds a random port on `127.0.0.1`, creates a per-run token, then opens the browser page.
+- **Stop on save** — after the mask is written, the helper responds, closes the server and all connections, and exits. It then returns to Pi for the prompt choice.
+- **Stop on cancel** — the Cancel button sends `/cancel`; closing the tab without saving sends a `pagehide` cancel beacon.
+- **Stop on timeout or abort** — the interactive timeout defaults to 600 seconds; aborting the tool terminates the child process.
+
+The service only serves the source image and accepts the mask for that single run. It is never a persistent daemon.
 
 ### Choosing a Model
 
@@ -139,10 +169,10 @@ The `generate_image` tool accepts:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | *required* | Description of the image to generate or edit |
-| `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model |
-| `maskPath` | string | — | Optional local mask path or `file://` URL for localized edits; requires `imagePath` |
-| `aspectRatio` | string | `1:1` | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
+| `prompt` | string | *required* | Description of the image to generate or edit. After a region is selected, this is offered as the suggested prompt; choose it or write a custom prompt |
+| `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
+| `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
+| `aspectRatio` | string | `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
 | `imageSize` | string | `1K` | `1K`, `2K`, `4K` (OpenRouter models only) |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
@@ -154,7 +184,8 @@ The `generate_image` tool accepts:
 - **API keys** — Resolved via `ctx.modelRegistry.getApiKeyForProvider()` (env vars, auth.json, OAuth)
 - **Base URLs** — From model data, settings providers, or Pi's registry
 - **Custom providers** — Define in `~/.pi/agent/settings/pi-image-gen.json`
-- **Image edits** — Use `imagePath` and optional `maskPath` with a provider configured as `openai-images`
+- **Image edits** — Use `imagePath` and optional `maskPath` with a provider configured as `openai-images`; omitting `maskPath` in the TUI first asks whether to select a region
+- **Mask selection** — The browser selector can create a mask inside Pi's interactive edit flow
 
 ## Architecture
 
