@@ -91,22 +91,143 @@ interface ExtensionConfig {
   downloadProxy?: string;
 }
 
+/** Strip JSONC syntax — line comments, block comments and trailing commas —
+ *  so a commented settings file parses. String contents are left untouched. */
+function stripJsonComments(text: string): string {
+  let out = "";
+  let inString = false;
+  let inLineComment = false;
+  let inBlockComment = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    const next = text[i + 1];
+
+    if (inLineComment) {
+      if (char === "\n") {
+        inLineComment = false;
+        out += char;
+      }
+      continue;
+    }
+    if (inBlockComment) {
+      if (char === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
+    if (inString) {
+      out += char;
+      if (char === "\\") {
+        out += next ?? "";
+        i += 1;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      out += char;
+      continue;
+    }
+    if (char === "/" && next === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (char === "/" && next === "*") {
+      inBlockComment = true;
+      i += 1;
+      continue;
+    }
+    out += char;
+  }
+
+  return out;
+}
+
+/** Drop trailing commas without touching strings: `,` followed only by
+ *  whitespace before `}` or `]`. */
+function stripTrailingCommas(text: string): string {
+  let out = "";
+  let inString = false;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const char = text[i];
+    if (inString) {
+      out += char;
+      if (char === "\\") {
+        out += text[i + 1] ?? "";
+        i += 1;
+      } else if (char === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === '"') {
+      inString = true;
+      out += char;
+      continue;
+    }
+    if (char === ",") {
+      let lookahead = i + 1;
+      while (lookahead < text.length && /\s/.test(text[lookahead])) lookahead += 1;
+      if (text[lookahead] === "}" || text[lookahead] === "]") continue;
+    }
+    out += char;
+  }
+
+  return out;
+}
+
+function stripJsonc(text: string): string {
+  return stripTrailingCommas(stripJsonComments(text));
+}
+
 function readJsonFile(path: string): Record<string, unknown> {
   if (!existsSync(path)) return {};
   try {
-    return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+    return JSON.parse(stripJsonc(readFileSync(path, "utf-8"))) as Record<string, unknown>;
   } catch {
     return {};
   }
 }
 
+/** Settings file names accepted in a settings directory, in priority order. */
+const CONFIG_FILENAMES = ["pi-image-gen.json", "pi-image-gen.jsonc"] as const;
+
+/** Interactive `/image-model` picks live here so a commented config is never
+ *  rewritten (that would discard the comments). */
+const MODEL_STATE_FILENAME = "pi-image-gen.state.json";
+
+function settingsDir(): string {
+  return join(getAgentDir(), "settings");
+}
+
+/** First settings file present in `dir`, `.json` before `.jsonc`. */
+function configPathIn(dir: string): string | undefined {
+  for (const name of CONFIG_FILENAMES) {
+    const candidate = join(dir, name);
+    if (existsSync(candidate)) return candidate;
+  }
+  return undefined;
+}
+
 function globalConfigPath(): string {
-  return join(getAgentDir(), "settings", "pi-image-gen.json");
+  return configPathIn(settingsDir()) ?? join(settingsDir(), CONFIG_FILENAMES[0]);
 }
 
 function loadConfig(cwd: string): ExtensionConfig {
-  const globalConfig = readJsonFile(globalConfigPath());
-  const projectConfig = readJsonFile(join(cwd, ".pi", "settings", "pi-image-gen.json"));
+  // Defaults chosen via /image-model sit between the global and project files:
+  // an explicit project config still wins, a global file does not.
+  const globalConfig = {
+    ...readJsonFile(globalConfigPath()),
+    ...readJsonFile(join(settingsDir(), MODEL_STATE_FILENAME)),
+  };
+  const projectPath = configPathIn(join(cwd, ".pi", "settings"));
+  const projectConfig = projectPath ? readJsonFile(projectPath) : {};
   const globalProviders = (globalConfig.providers || {}) as Record<string, unknown>;
   const projectProviders = (projectConfig.providers || {}) as Record<string, unknown>;
   return {
@@ -116,13 +237,13 @@ function loadConfig(cwd: string): ExtensionConfig {
   } as ExtensionConfig;
 }
 
-/** Persist model selection to global config so it survives across sessions. */
+/** Persist model selection so it survives across sessions. */
 async function saveDefaultModel(provider: string, modelId: string): Promise<void> {
-  const path = globalConfigPath();
+  const path = join(settingsDir(), MODEL_STATE_FILENAME);
   const existing = readJsonFile(path);
   existing.defaultProvider = provider;
   existing.defaultModel = modelId;
-  await mkdir(join(getAgentDir(), "settings"), { recursive: true });
+  await mkdir(settingsDir(), { recursive: true });
   await writeFile(path, JSON.stringify(existing, null, 2));
 }
 

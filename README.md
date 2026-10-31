@@ -112,7 +112,9 @@ When generating an image, the model is resolved in this order:
 
 [`settings.example.jsonc`](settings.example.jsonc) contains every supported field with inline comments — save modes, timeouts, proxy, and four provider shapes (OpenAI-compatible relay, OpenAI direct, Gemini/Imagen, local server). A copy lives at `~/.pi/agent/settings/pi-image-gen.example.jsonc` for reference while editing.
 
-Note that `pi-image-gen.json` itself must stay strict JSON: the loader uses `JSON.parse`, so a `//` comment silently discards the entire file. Strip the comments when copying from the example.
+The loader accepts JSONC: `//` line comments, `/* */` block comments and trailing commas are stripped before parsing, so the example can be pasted straight into your config. Both `pi-image-gen.json` and `pi-image-gen.jsonc` are read (`.json` first), globally and per project.
+
+Picks made through `/image-model` are written to `pi-image-gen.state.json` rather than into your config, so a commented config is never rewritten.
 
 Two rules that surprise people:
 
@@ -121,7 +123,7 @@ Two rules that surprise people:
 
 ### Custom Models via Settings
 
-Define image providers in `~/.pi/agent/settings/pi-image-gen.json` (global) or `<project>/.pi/settings/pi-image-gen.json` (project-local, overrides global):
+Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) or `<project>/.pi/settings/pi-image-gen.json[c]` (project-local, overrides global):
 
 ```json
 {

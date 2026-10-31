@@ -1,12 +1,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// pi-image-gen 1.2.0 — complete settings reference
+// pi-image-gen 1.2.1 — complete settings reference
 //
-// This file is documentation, not configuration. The extension parses
-// pi-image-gen.json with JSON.parse, so comments would silently discard the
-// whole file. Copy the parts you need into one of:
+// The loader accepts JSONC, so this file can be used as-is: comments and
+// trailing commas are stripped before parsing. Name it either
 //
-//   ~/.pi/agent/settings/pi-image-gen.json          global
-//   <your-repo>/.pi/settings/pi-image-gen.json      project (wins per key)
+//   ~/.pi/agent/settings/pi-image-gen.jsonc         global
+//   <your-repo>/.pi/settings/pi-image-gen.jsonc     project (wins per key)
+//
+// or keep the .json extension — both are read, .json first.
 //
 // Two things bite people, so read these first:
 //
