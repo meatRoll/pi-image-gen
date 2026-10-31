@@ -6,14 +6,14 @@
 pi install @meatroll/pi-image-gen
 ```
 
-Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native Gemini image API, so any OpenAI-compatible relay works.
+Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native image APIs (`generateContent` for Gemini image models, `predict` for Imagen), so any OpenAI-compatible relay works.
 
 ## Features
 
 - 🎨 **Built-in models** — OpenAI (GPT Image, DALL-E) and Google Gemini
 - 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
-- 🖼️ **Aspect ratios & quality** — 1:1, 16:9, 9:16, 4:3, etc. with quality controls
+- 🖼️ **Aspect ratios & resolution** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` maps to Gemini's 1K/2K/4K tiers
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
 - 🎯 **`/image-model` command** — Interactive fuzzy-search model picker with session persistence
 - 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, choose the suggested prompt or write a custom one
@@ -96,7 +96,7 @@ Models come from the static catalog in `scripts/generate-image-models.ts`. Run `
 | Provider | Models | API Key | API Type |
 |----------|--------|---------|----------|
 | **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` and `/v1/images/edits` |
-| **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | Gemini `generateContent` |
+| **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | `:generateContent` (Gemini image models) and `:predict` (Imagen) |
 
 ## Resolution Order
 
@@ -140,7 +140,7 @@ For providers whose signed image URLs require server-side authentication, set `r
 | Type | Used By | Endpoint |
 |------|---------|----------|
 | `openai-images` | OpenAI direct and any OpenAI-compatible relay | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
-| `google-generative-ai-image` | Google Gemini | `POST /models/{id}:generateContent` |
+| `google-generative-ai-image` | Google Gemini / Imagen | `POST /models/{id}:generateContent` for Gemini image models; `POST /models/{id}:predict` for `imagen-*` models |
 
 Model-level `api` overrides provider-level `api`.
 
@@ -171,7 +171,7 @@ The `generate_image` tool accepts:
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
 | `aspectRatio` | string | `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
-| `imageSize` | string | `1K` | `1K`, `2K`, `4K` (provider-dependent; not used by the OpenAI Images API) |
+| `imageSize` | string | `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; the OpenAI Images API has no equivalent and ignores it |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |

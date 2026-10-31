@@ -693,6 +693,69 @@ function isGptImageModel(modelId: string): boolean {
   return modelId.startsWith("gpt-image-") || modelId === "chatgpt-image-latest";
 }
 
+/** Detect an image MIME type from magic bytes. */
+function sniffImageMime(bytes: Buffer): string | undefined {
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  if (bytes.subarray(0, 4).toString("ascii") === "GIF8") return "image/gif";
+  return undefined;
+}
+
+/** Parse a `data:<mime>[;base64],<payload>` URL into base64 + mime. */
+function parseDataUrl(value: string): GeneratedImage | undefined {
+  const trimmed = value.trim();
+  const comma = trimmed.indexOf(",");
+  if (comma < 0 || !trimmed.slice(0, comma).toLowerCase().startsWith("data:")) return undefined;
+  const header = trimmed.slice(0, comma);
+  const mimeType = header.slice("data:".length).split(";", 1)[0] || "image/png";
+  if (!mimeType.startsWith("image/")) return undefined;
+  const payload = trimmed.slice(comma + 1);
+  if (header.toLowerCase().includes(";base64")) {
+    return { data: payload.replace(/\s+/g, ""), mimeType };
+  }
+  return { data: Buffer.from(decodeURIComponent(payload), "binary").toString("base64"), mimeType };
+}
+
+/** Hosts whose signed media URLs reject plain requests and need the Chrome transport. */
+const GOOGLE_MEDIA_HOSTS = new Set([
+  "lh3.googleusercontent.com",
+  "lh3.google.com",
+  "work.fife.usercontent.google.com",
+]);
+
+/** Materialize a data URL, or download an http(s) image into base64 + mime.
+ *
+ * Plain `fetch` covers any OpenAI-compatible CDN, which is what a standard
+ * `data[].url` response points at. Signed Gemini media hosts are the exception:
+ * they only answer the browser-shaped request, so they fall back to curl.
+ */
+async function downloadImageUrl(
+  url: string,
+  options: { signal?: AbortSignal; downloadProxy?: string } = {},
+): Promise<GeneratedImage> {
+  const inline = parseDataUrl(url);
+  if (inline) return inline;
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error("Unsupported image reference: expected an http(s) URL or a base64 data URL.");
+  }
+
+  const host = new URL(url).hostname;
+  try {
+    const response = await fetch(url, { signal: options.signal });
+    if (!response.ok) throw new Error(`Image download failed (${response.status})`);
+    const buffer = Buffer.from(await response.arrayBuffer());
+    const contentType = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+    return {
+      data: buffer.toString("base64"),
+      mimeType: contentType.startsWith("image/") ? contentType : sniffImageMime(buffer) || "image/png",
+    };
+  } catch (error) {
+    if (!GOOGLE_MEDIA_HOSTS.has(host)) throw error;
+    return downloadGeminiImageLocally(url, options.downloadProxy, options.signal);
+  }
+}
+
 /** OpenAI /v1/images/generations and /v1/images/edits endpoints */
 async function generateViaOpenAIImages(
   config: ProviderConfig,
@@ -752,33 +815,101 @@ async function generateViaOpenAIImages(
     throw new Error(`OpenAI ${operation} failed (${response.status}): ${errorText}`);
   }
 
-  const result = (await response.json()) as { data: Array<{ b64_json?: string; url?: string }> };
-  if (result.data[0]?.b64_json) {
-    const encoded = result.data[0].b64_json;
-    const bytes = Buffer.from(encoded, "base64");
-    let mimeType = "image/png";
-    if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) mimeType = "image/jpeg";
-    else if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) mimeType = "image/png";
-    else if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") mimeType = "image/webp";
-    return { data: encoded, mimeType };
+  const result = (await response.json()) as {
+    data?: Array<{ b64_json?: string; url?: string; media_type?: string }>;
+  };
+  const image = result.data?.[0];
+  if (image?.b64_json) {
+    const bytes = Buffer.from(image.b64_json, "base64");
+    return {
+      data: image.b64_json,
+      mimeType: image.media_type?.split(";", 1)[0] || sniffImageMime(bytes) || "image/png",
+    };
   }
-  const imageUrl = result.data[0]?.url;
-  if (imageUrl) {
-    const dataUrl = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(imageUrl);
-    if (dataUrl) return { data: dataUrl[2], mimeType: dataUrl[1] };
-
-    return downloadGeminiImageLocally(imageUrl, config.downloadProxy, signal);
+  if (image?.url) {
+    // Standard behaviour: honour the URL as given. Relays usually hand back a
+    // server-owned data URL; anything else is just fetched.
+    return downloadImageUrl(image.url, { signal, downloadProxy: config.downloadProxy });
   }
   throw new Error(`OpenAI ${operation} returned no image data`);
 }
 
-/** Google Gemini generateContent with responseModalities: ["IMAGE"] */
+/** Google Gemini image generation.
+ *
+ * Two request shapes share this API type:
+ * - Imagen models (`imagen-*`) use `:predict` with `instances`/`parameters`.
+ * - Gemini image models use `:generateContent` with `responseModalities`.
+ */
 async function generateViaGoogleImage(
   config: ProviderConfig,
   model: ImageModel,
   prompt: string,
+  aspectRatio: string,
+  imageSize: string,
   signal?: AbortSignal,
 ): Promise<GeneratedImage> {
+  return model.id.startsWith("imagen-")
+    ? generateViaImagenPredict(config, model, prompt, aspectRatio, signal)
+    : generateViaGeminiGenerateContent(config, model, prompt, aspectRatio, imageSize, signal);
+}
+
+/** Imagen: POST {baseUrl}/models/{id}:predict */
+async function generateViaImagenPredict(
+  config: ProviderConfig,
+  model: ImageModel,
+  prompt: string,
+  aspectRatio: string,
+  signal?: AbortSignal,
+): Promise<GeneratedImage> {
+  // Imagen only accepts this subset; anything else keeps the model default.
+  const IMAGEN_RATIOS = new Set(["1:1", "3:4", "4:3", "9:16", "16:9"]);
+  const parameters: Record<string, unknown> = { sampleCount: 1 };
+  if (aspectRatio && IMAGEN_RATIOS.has(aspectRatio)) parameters.aspectRatio = aspectRatio;
+
+  const response = await fetch(
+    `${config.baseUrl}/models/${model.id}:predict?key=${config.apiKey}`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ instances: [{ prompt }], parameters }),
+      signal,
+    },
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Imagen image generation failed (${response.status}): ${errorText}`);
+  }
+
+  const result = (await response.json()) as {
+    predictions?: Array<{ bytesBase64Encoded?: string; mimeType?: string }>;
+  };
+  const prediction = result.predictions?.[0];
+  if (prediction?.bytesBase64Encoded) {
+    return {
+      data: prediction.bytesBase64Encoded,
+      mimeType: prediction.mimeType || "image/png",
+    };
+  }
+  throw new Error("Imagen returned no image data (expected predictions[0].bytesBase64Encoded)");
+}
+
+/** Gemini image models: POST {baseUrl}/models/{id}:generateContent */
+async function generateViaGeminiGenerateContent(
+  config: ProviderConfig,
+  model: ImageModel,
+  prompt: string,
+  aspectRatio: string,
+  imageSize: string,
+  signal?: AbortSignal,
+): Promise<GeneratedImage> {
+  const imageConfig: Record<string, string> = {};
+  if (aspectRatio) imageConfig.aspectRatio = aspectRatio;
+  if (imageSize) imageConfig.imageSize = imageSize;
+
+  const generationConfig: Record<string, unknown> = { responseModalities: ["TEXT", "IMAGE"] };
+  if (Object.keys(imageConfig).length > 0) generationConfig.imageConfig = imageConfig;
+
   const response = await fetch(
     `${config.baseUrl}/models/${model.id}:generateContent?key=${config.apiKey}`,
     {
@@ -786,7 +917,7 @@ async function generateViaGoogleImage(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { responseModalities: ["TEXT", "IMAGE"] },
+        generationConfig,
       }),
       signal,
     },
@@ -835,7 +966,7 @@ async function generateImage(
     case "openai-images":
       return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, inputImage, maskImage, signal);
     case "google-generative-ai-image":
-      return generateViaGoogleImage(config, model, prompt, signal);
+      return generateViaGoogleImage(config, model, prompt, aspectRatio, imageSize, signal);
     default:
       throw new Error(`Unknown image API type: ${model.api}`);
   }
