@@ -108,6 +108,17 @@ When generating an image, the model is resolved in this order:
 
 ## Configuration
 
+### Full reference
+
+[`settings.example.jsonc`](settings.example.jsonc) contains every supported field with inline comments — save modes, timeouts, proxy, and four provider shapes (OpenAI-compatible relay, OpenAI direct, Gemini/Imagen, local server). A copy lives at `~/.pi/agent/settings/pi-image-gen.example.jsonc` for reference while editing.
+
+Note that `pi-image-gen.json` itself must stay strict JSON: the loader uses `JSON.parse`, so a `//` comment silently discards the entire file. Strip the comments when copying from the example.
+
+Two rules that surprise people:
+
+- Declaring any `providers` entry replaces the built-in model catalog. List every provider you want to keep.
+- `saveDir` is used verbatim — `~` is not expanded. Use an absolute path.
+
 ### Custom Models via Settings
 
 Define image providers in `~/.pi/agent/settings/pi-image-gen.json` (global) or `<project>/.pi/settings/pi-image-gen.json` (project-local, overrides global):

@@ -12,6 +12,7 @@
     "extensions/",
     "lib/",
     "scripts/",
+    "settings.example.jsonc",
     "README.md",
     "LICENSE",
     "screenshot.png"

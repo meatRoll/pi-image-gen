@@ -1,0 +1,130 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// pi-image-gen — complete settings reference
+//
+// This file is documentation, not configuration. The extension parses
+// pi-image-gen.json with JSON.parse, so comments would silently discard the
+// whole file. Copy the parts you need into one of:
+//
+//   ~/.pi/agent/settings/pi-image-gen.json          global
+//   <your-repo>/.pi/settings/pi-image-gen.json      project (wins per key)
+//
+// Two things bite people, so read these first:
+//
+//   1. Declaring ANY provider here replaces the built-in model catalog
+//      (gpt-image-1, dall-e-3, Gemini, Imagen). List every provider you want.
+//   2. `saveDir` is used verbatim: "~" is NOT expanded. Use an absolute path.
+// ─────────────────────────────────────────────────────────────────────────────
+
+{
+  // Which model is used when the session has no /image-model selection.
+  // defaultModel is matched by id across all providers and wins over
+  // defaultProvider; defaultProvider then falls back to that provider's
+  // first model. With neither set, the first `openai` model is used.
+  "defaultProvider": "my-relay",
+  "defaultModel": "image-model-1",
+
+  // Where generated images are written. Images are always saved locally.
+  //   "project" → <cwd>/.pi/generated-images/     (default)
+  //   "global"  → ~/.pi/agent/generated-images/
+  //   "custom"  → saveDir, must be an absolute path
+  "save": "custom",
+  "saveDir": "/path/to/Pictures/pi-generated",
+
+  // Per-request timeout in seconds. Default: 600 (10 minutes).
+  // Slow relay queues routinely need 60-120s; raise it for 4K models.
+  "timeout": 600,
+
+  // Proxy used only by the curl-based downloader for signed Gemini image
+  // URLs. Ordinary OpenAI-compatible CDNs are fetched directly and ignore it.
+  "downloadProxy": "http://127.0.0.1:7890",
+
+  "providers": {
+    // ── OpenAI-compatible relay ──────────────────────────────────────────────
+    // Most third-party gateways (New API, one-api, LiteLLM, LM Studio, vLLM,
+    // ComfyUI proxies) expose POST {baseUrl}/images/generations.
+    "my-relay": {
+      "baseUrl": "https://api.example.com/v1", // endpoint = {baseUrl}/images/generations
+      "apiKey": "sk-REPLACE_WITH_YOUR_KEY",    // omit to fall back to Pi's ModelRegistry / env
+      "api": "openai-images",                  // the only OpenAI-style API type
+      "responseFormat": "b64_json",            // "url" (default) or "b64_json"
+      "models": [
+        {
+          "id": "image-model-1",       // sent as the `model` field
+          "name": "Image Model 1",     // label in /image-model
+          "cost": 0                    // display only, not used for billing
+        },
+        {
+          "id": "image-model-2",
+          "name": "Image Model 2",
+          "api": "openai-images"       // optional per-model override
+        }
+      ]
+    },
+
+    // ── OpenAI direct ────────────────────────────────────────────────────────
+    // apiKey is optional when OPENAI_API_KEY is set or /login stored it.
+    "openai": {
+      "baseUrl": "https://api.openai.com/v1",
+      "api": "openai-images",
+      "responseFormat": "b64_json",
+      "models": [
+        { "id": "gpt-image-1", "name": "GPT Image 1", "cost": 0.04 },
+        { "id": "dall-e-3", "name": "DALL-E 3", "cost": 0.04 }
+      ]
+    },
+
+    // ── Google Gemini / Imagen ───────────────────────────────────────────────
+    // This provider type dispatches by model id:
+    //   gemini-*  → POST {baseUrl}/models/{id}:generateContent  (inlineData)
+    //   imagen-*  → POST {baseUrl}/models/{id}:predict          (predictions)
+    "google": {
+      "baseUrl": "https://generativelanguage.googleapis.com/v1beta",
+      "apiKey": "REPLACE_WITH_GEMINI_KEY",
+      "api": "google-generative-ai-image",
+      "models": [
+        {
+          "id": "gemini-2.0-flash-preview-image-generation",
+          "name": "Gemini 2.0 Flash Image",
+          "cost": 0
+        },
+        {
+          "id": "imagen-3.0-generate-002",
+          "name": "Imagen 3",
+          "cost": 0
+        }
+      ]
+    },
+
+    // ── Local server ─────────────────────────────────────────────────────────
+    // Anything that speaks the OpenAI Images API works; the key is ignored
+    // by most local servers but the field has to be non-empty.
+    "local": {
+      "baseUrl": "http://127.0.0.1:8080/v1",
+      "apiKey": "not-needed",
+      "api": "openai-images",
+      "responseFormat": "b64_json",
+      "models": [{ "id": "local-model", "name": "Local Model" }]
+    }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Notes
+//
+// • Model resolution order:
+//     /image-model selection → defaultModel → defaultProvider's first model
+//     → first `openai` model → any model
+//
+// • Tool parameters override settings per call: save, saveDir, timeout,
+//   aspectRatio (1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9),
+//   imageSize (1K/2K/4K — Gemini only), quality (auto/low/medium/high —
+//   OpenAI models only), imagePath + maskPath (routes to /images/edits).
+//
+// • `responseFormat: "b64_json"` is the safe choice for relays: it asks for
+//   the image bytes instead of a URL you may not be able to fetch. Note that
+//   many relays ignore it and inline a data URL anyway — both are handled.
+//
+// • Legacy alternative: entries in ~/.pi/agent/models.json tagged with
+//   "output": ["image"] (optionally "imageApi"/"imageCost") are still read,
+//   but only when no `providers` are declared here.
+// ─────────────────────────────────────────────────────────────────────────────
