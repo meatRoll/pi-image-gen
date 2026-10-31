@@ -1,6 +1,6 @@
 {
   "name": "@meatroll/pi-image-gen",
-  "version": "1.2.0",
+  "version": "1.1.0",
   "type": "module",
   "description": "Provider-agnostic image generation for Pi coding agent",
   "author": "ssweens",
@@ -17,9 +17,7 @@
     "screenshot.png"
   ],
   "scripts": {
-    "generate-models": "npx tsx scripts/generate-image-models.ts",
-    "build:test-module": "node scripts/build-test-module.mjs",
-    "test": "node scripts/build-test-module.mjs && node --test test/*.test.mjs"
+    "generate-models": "npx tsx scripts/generate-image-models.ts"
   },
   "pi": {
     "extensions": [
