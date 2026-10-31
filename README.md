@@ -56,7 +56,7 @@ After a region is saved, Pi asks whether to use the suggested prompt or write a 
 
 The selected region(s) are converted to a PNG mask automatically and saved under `.pi/generated-images/`. In non-TUI or headless mode, omitting `maskPath` edits the whole image. Pass `maskPath` only when a mask has already been prepared. For edits, the output aspect ratio defaults to the input image's nearest supported ratio unless `aspectRatio` is set explicitly.
 
-The selected model must use the `openai-images` API type for image editing. OpenRouter chat-image and Google models continue to support text-to-image generation through their existing APIs.
+The selected model must use the `openai-images` API type for image editing. OpenRouter image-API, legacy chat-image, and Google models continue to support text-to-image generation through their existing APIs.
 
 ### Browser mask selector
 
@@ -97,7 +97,7 @@ Models are auto-generated from OpenRouter's API and static catalogs. Run `npm ru
 |----------|--------|---------|----------|
 | **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` and `/v1/images/edits` |
 | **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | Gemini `generateContent` |
-| **openrouter** | `openai/gpt-5-image`, `openai/gpt-5-image-mini`, `google/gemini-2.5-flash-image`, `google/gemini-3-pro-image-preview`, FLUX.2 variants, Seedream, Riverflow, and more | `OPENROUTER_API_KEY` | Chat completions |
+| **openrouter** | `openai/gpt-5-image`, `openai/gpt-5-image-mini`, `google/gemini-2.5-flash-image`, `google/gemini-3-pro-image-preview`, FLUX.2 variants, Seedream, Riverflow, and more | `OPENROUTER_API_KEY` | `POST /api/v1/images` |
 
 ## Resolution Order
 
@@ -140,9 +140,15 @@ For providers whose signed image URLs require server-side authentication, set `r
 
 | Type | Used By | Endpoint |
 |------|---------|----------|
-| `openai-images` | OpenAI direct | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
-| `openai-chat-image` | OpenRouter | `POST /v1/chat/completions` with `modalities: ["image"]` |
+| `openai-images` | OpenAI direct, OpenAI-compatible relays | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
+| `openrouter-images` | OpenRouter | `POST /api/v1/images` — request `aspect_ratio` / `resolution` / `quality`, response `data[].b64_json` + `media_type` |
+| `openai-chat-image` | **Legacy** — relays that only expose chat completions | `POST /v1/chat/completions` with `modalities: ["image"]`; accepts `message.images[]`, a Markdown data URL, or a plain image link in `message.content` |
 | `google-generative-ai-image` | Google Gemini | `POST /models/{id}:generateContent` |
+
+References for the two standard shapes:
+
+- OpenAI Images API — <https://platform.openai.com/docs/api-reference/images> (`{ created, data: [{ b64_json?, url? }] }`). OpenAI chat completions has no image output field; `modalities` there only covers text and audio.
+- OpenRouter Image API — <https://openrouter.ai/docs/features/multimodal/image-generation> (`POST /api/v1/images` → `{ created, data: [{ b64_json, media_type }], usage }`). OpenRouter now documents this endpoint instead of the older chat-completions image output.
 
 Model-level `api` overrides provider-level `api`.
 
@@ -173,7 +179,7 @@ The `generate_image` tool accepts:
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
 | `aspectRatio` | string | `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
-| `imageSize` | string | `1K` | `1K`, `2K`, `4K` (OpenRouter models only) |
+| `imageSize` | string | `1K` | `1K`, `2K`, `4K` (sent as `resolution` by `openrouter-images`) |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |

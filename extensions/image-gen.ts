@@ -9,8 +9,13 @@
  * - Session-persisted selection via pi.appendEntry()
  *
  * API types:
- *   openai-images           — POST /v1/images/generations or /v1/images/edits (OpenAI direct)
- *   openai-chat-image       — POST /v1/chat/completions with image output (OpenRouter)
+ *   openai-images              — OpenAI Images API: POST /images/generations, /images/edits
+ *                                https://platform.openai.com/docs/api-reference/images
+ *   openrouter-images          — OpenRouter Image API: POST /images
+ *                                { created, data: [{ b64_json, media_type }], usage }
+ *                                https://openrouter.ai/docs/features/multimodal/image-generation
+ *   openai-chat-image          — Legacy: POST /chat/completions with modalities: ["image"]
+ *                                OpenRouter dropped it in favor of the Image API above.
  *   google-generative-ai-image — POST generateContent with responseModalities (Google)
  */
 
@@ -184,13 +189,18 @@ interface ModelsJsonConfig {
   providers?: Record<string, ModelsJsonProviderConfig>;
 }
 
-/** Infer legacy image API type from provider name and model api field */
+/** Infer the API type for entries that do not declare one.
+ *
+ * Defaults to the standard OpenAI Images endpoint, which is what
+ * OpenAI-compatible relays expose; `/chat/completions` image output is a
+ * legacy shape and has to be opted into explicitly. */
 function inferLegacyImageApi(provider: string, apiField?: string): ImageApi {
   if (provider === "google") return "google-generative-ai-image";
-  if (provider === "openrouter") return "openai-chat-image";
+  if (provider === "openrouter") return "openrouter-images";
   if (provider === "openai") return "openai-images";
   if (apiField?.includes("google")) return "google-generative-ai-image";
-  return "openai-chat-image";
+  if (apiField?.includes("chat")) return "openai-chat-image";
+  return "openai-images";
 }
 
 function readModelsJson(): Partial<ModelsJsonConfig> {
@@ -326,7 +336,7 @@ async function refreshDiscoveryCache(): Promise<void> {
           name: model.name,
           provider: "openrouter",
           baseUrl: "https://openrouter.ai/api/v1",
-          api: "openai-chat-image",
+          api: "openrouter-images",
           cost: 0,
         });
       }
@@ -353,7 +363,7 @@ async function refreshDiscoveryCache(): Promise<void> {
           name: model.name,
           provider: "openrouter",
           baseUrl: "https://openrouter.ai/api/v1",
-          api: "openai-chat-image",
+          api: "openrouter-images",
           cost: 0,
         });
       }
@@ -819,6 +829,50 @@ function isGptImageModel(modelId: string): boolean {
   return modelId.startsWith("gpt-image-") || modelId === "chatgpt-image-latest";
 }
 
+/** Detect an image MIME type from magic bytes. */
+function sniffImageMime(bytes: Buffer): string | undefined {
+  if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) return "image/jpeg";
+  if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return "image/png";
+  if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") return "image/webp";
+  if (bytes.subarray(0, 4).toString("ascii") === "GIF8") return "image/gif";
+  return undefined;
+}
+
+/** Parse a `data:<mime>[;base64],<payload>` URL into base64 + mime. */
+function parseDataUrl(value: string): GeneratedImage | undefined {
+  const trimmed = value.trim();
+  const comma = trimmed.indexOf(",");
+  if (comma < 0 || !trimmed.slice(0, comma).toLowerCase().startsWith("data:")) return undefined;
+  const header = trimmed.slice(0, comma);
+  const mimeType = header.slice("data:".length).split(";", 1)[0] || "image/png";
+  if (!mimeType.startsWith("image/")) return undefined;
+  const payload = trimmed.slice(comma + 1);
+  if (header.toLowerCase().includes(";base64")) {
+    return { data: payload.replace(/\s+/g, ""), mimeType };
+  }
+  return { data: Buffer.from(decodeURIComponent(payload), "binary").toString("base64"), mimeType };
+}
+
+/** Materialize a data URL, or download an http(s) image into base64 + mime. */
+async function downloadImageUrl(
+  url: string,
+  options: { signal?: AbortSignal; downloadProxy?: string } = {},
+): Promise<GeneratedImage> {
+  const inline = parseDataUrl(url);
+  if (inline) return inline;
+  if (!/^https?:\/\//i.test(url)) {
+    throw new Error("Unsupported image reference: expected an http(s) URL or a base64 data URL.");
+  }
+  const response = await fetch(url, { signal: options.signal });
+  if (!response.ok) throw new Error(`Image download failed (${response.status})`);
+  const buffer = Buffer.from(await response.arrayBuffer());
+  const contentType = (response.headers.get("content-type") || "").split(";", 1)[0].trim().toLowerCase();
+  return {
+    data: buffer.toString("base64"),
+    mimeType: contentType.startsWith("image/") ? contentType : sniffImageMime(buffer) || "image/png",
+  };
+}
+
 /** OpenAI /v1/images/generations and /v1/images/edits endpoints */
 async function generateViaOpenAIImages(
   config: ProviderConfig,
@@ -878,31 +932,126 @@ async function generateViaOpenAIImages(
     throw new Error(`OpenAI ${operation} failed (${response.status}): ${errorText}`);
   }
 
-  const result = (await response.json()) as { data: Array<{ b64_json?: string; url?: string }> };
-  if (result.data[0]?.b64_json) {
-    const encoded = result.data[0].b64_json;
-    const bytes = Buffer.from(encoded, "base64");
-    let mimeType = "image/png";
-    if (bytes.subarray(0, 3).equals(Buffer.from([0xff, 0xd8, 0xff]))) mimeType = "image/jpeg";
-    else if (bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) mimeType = "image/png";
-    else if (bytes.subarray(0, 4).toString("ascii") === "RIFF" && bytes.subarray(8, 12).toString("ascii") === "WEBP") mimeType = "image/webp";
-    return { data: encoded, mimeType };
+  const result = (await response.json()) as {
+    data?: Array<{ b64_json?: string; url?: string; media_type?: string }>;
+  };
+  const image = result.data?.[0];
+  if (image?.b64_json) {
+    const bytes = Buffer.from(image.b64_json, "base64");
+    return {
+      data: image.b64_json,
+      mimeType: image.media_type?.split(";", 1)[0] || sniffImageMime(bytes) || "image/png",
+    };
   }
-  const imageUrl = result.data[0]?.url;
-  if (imageUrl) {
-    const dataUrl = /^data:(image\/[\w.+-]+);base64,(.*)$/s.exec(imageUrl);
-    if (dataUrl) return { data: dataUrl[2], mimeType: dataUrl[1] };
+  if (image?.url) {
+    const dataUrl = parseDataUrl(image.url);
+    if (dataUrl) return dataUrl;
 
-    return downloadGeminiImageLocally(imageUrl, config.downloadProxy, signal);
+    return downloadGeminiImageLocally(image.url, config.downloadProxy, signal);
   }
   throw new Error(`OpenAI ${operation} returned no image data`);
 }
 
-/** OpenRouter chat completions with image output.
+/** OpenRouter Image API: `POST {baseUrl}/images`
  *
- * Uses `modalities: ["image"]` so image-only endpoints can route successfully.
- * Response includes `message.images[]` with base64 data URLs.
- * See: https://openrouter.ai/docs/features/image-generation
+ * Request: `model`, `prompt`, `aspect_ratio`, `resolution`, `size`, `quality`,
+ * `output_format`, `n`, `input_references`.
+ * Response: `{ created, data: [{ b64_json, media_type }], usage }`.
+ * See: https://openrouter.ai/docs/features/multimodal/image-generation
+ */
+async function generateViaOpenRouterImages(
+  config: ProviderConfig,
+  model: ImageModel,
+  prompt: string,
+  aspectRatio: string,
+  imageSize: string,
+  quality: string,
+  signal?: AbortSignal,
+): Promise<GeneratedImage> {
+  const body: Record<string, unknown> = { model: model.id, prompt, n: 1 };
+  if (aspectRatio) body.aspect_ratio = aspectRatio;
+  if (imageSize) body.resolution = imageSize;
+  if (quality && quality !== "auto") body.quality = quality;
+
+  const response = await fetch(`${config.baseUrl}/images`, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${config.apiKey}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`OpenRouter image generation failed (${response.status}): ${errorText}`);
+  }
+
+  const result = (await response.json()) as {
+    data?: Array<{ b64_json?: string; url?: string; media_type?: string }>;
+    error?: { message?: string };
+  };
+  if (result.error?.message) {
+    throw new Error(`OpenRouter image generation failed: ${result.error.message}`);
+  }
+
+  const image = result.data?.[0];
+  if (!image) {
+    throw new Error("OpenRouter returned no image data (expected data[0].b64_json or data[0].url)");
+  }
+  if (image.b64_json) {
+    const bytes = Buffer.from(image.b64_json, "base64");
+    return {
+      data: image.b64_json,
+      mimeType: image.media_type?.split(";", 1)[0] || sniffImageMime(bytes) || "image/png",
+    };
+  }
+  if (image.url) {
+    return downloadImageUrl(image.url, { signal, downloadProxy: config.downloadProxy });
+  }
+  throw new Error("OpenRouter returned no image data (expected data[0].b64_json or data[0].url)");
+}
+
+/** Collect candidate image references from a chat-completions message.
+ *
+ * Legacy OpenRouter relays answer with `message.images[]` holding data URLs.
+ * OpenAI-compatible relays that squat on `/chat/completions` instead inline
+ * the image in `message.content` as a Markdown data URL or a plain image link.
+ */
+function collectChatImageCandidates(message: {
+  content?: unknown;
+  images?: Array<{ image_url?: { url?: string } }>;
+}): string[] {
+  const urls: string[] = [];
+  for (const image of message.images ?? []) {
+    const url = image?.image_url?.url;
+    if (typeof url === "string" && url) urls.push(url);
+  }
+
+  const content = typeof message.content === "string" ? message.content : "";
+  if (content) {
+    for (const match of content.matchAll(/data:image\/[a-zA-Z0-9.+-]+;base64,[A-Za-z0-9+/=\s]+/g)) {
+      urls.push(match[0].replace(/\s+/g, ""));
+    }
+    // Signed CDN URLs often carry no file extension, so accept Markdown image
+    // targets and bare links instead of matching on a suffix.
+    for (const match of content.matchAll(/!\[[^\]]*\]\(\s*([^)\s]+)\s*\)/g)) {
+      urls.push(match[1]);
+    }
+    for (const match of content.matchAll(/https?:\/\/[^\s"'()<>\]]+/g)) {
+      urls.push(match[0]);
+    }
+  }
+
+  return [...new Set(urls)];
+}
+
+/** Legacy chat-completions image output (`modalities: ["image"]`).
+ *
+ * OpenRouter documented this before the dedicated Image API existed; it is
+ * kept for relays that only expose `/chat/completions`. The response shape is
+ * not standardized — see `collectChatImageCandidates`.
  */
 async function generateViaChatImage(
   config: ProviderConfig,
@@ -942,45 +1091,53 @@ async function generateViaChatImage(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`OpenRouter image generation failed (${response.status}): ${errorText}`);
+    throw new Error(
+      `Chat-completions image generation failed (${response.status}) for ${model.provider}/${model.id}: ${errorText}`,
+    );
   }
 
   const result = (await response.json()) as {
-    choices: Array<{
-      message: {
-        content?: string;
-        images?: Array<{
-          type: string;
-          image_url: { url: string };
-        }>;
+    choices?: Array<{
+      message?: {
+        content?: unknown;
+        images?: Array<{ image_url?: { url?: string } }>;
       };
     }>;
+    error?: { message?: string };
   };
 
-  const message = result.choices[0]?.message;
-  if (!message) throw new Error("No message in OpenRouter response");
-
-  // Images are in message.images[], each with a base64 data URL
-  if (message.images && message.images.length > 0) {
-    const url = message.images[0].image_url.url;
-    if (url.startsWith("data:")) {
-      const commaIdx = url.indexOf(",");
-      const header = url.slice(0, commaIdx);
-      const data = url.slice(commaIdx + 1);
-      const mimeType = header.match(/data:(.*);/)?.[1] || "image/png";
-      return { data, mimeType };
-    }
-    // URL-based — fetch and convert
-    const imgResponse = await fetch(url, { signal });
-    const buffer = await imgResponse.arrayBuffer();
-    return {
-      data: Buffer.from(buffer).toString("base64"),
-      mimeType: imgResponse.headers.get("content-type") || "image/png",
-    };
+  if (result.error?.message) {
+    throw new Error(`Chat-completions image generation failed for ${model.provider}/${model.id}: ${result.error.message}`);
   }
 
-  throw new Error("No images in OpenRouter response. Ensure the model supports image generation.");
+  const message = result.choices?.[0]?.message;
+  if (!message) {
+    throw new Error(`No message in the ${model.provider}/${model.id} chat-completions response`);
+  }
+
+  const candidates = collectChatImageCandidates(message);
+  if (candidates.length === 0) {
+    throw new Error(
+      `No image in the ${model.provider}/${model.id} chat-completions response: ` +
+      "neither message.images[] nor an image data URL / link in message.content. " +
+      "Use api \"openai-images\" or \"openrouter-images\" if the provider exposes a standard image endpoint.",
+    );
+  }
+
+  const failures: string[] = [];
+  for (const url of candidates) {
+    try {
+      return await downloadImageUrl(url, { signal, downloadProxy: config.downloadProxy });
+    } catch (error) {
+      failures.push(error instanceof Error ? error.message : String(error));
+    }
+  }
+  throw new Error(
+    `Found ${candidates.length} image reference(s) in the ${model.provider}/${model.id} response but none could be read: ${failures.join("; ")}`,
+  );
 }
+
+/** Google Gemini generateContent with responseModalities: ["IMAGE"] */
 
 /** Google Gemini generateContent with responseModalities: ["IMAGE"] */
 async function generateViaGoogleImage(
@@ -1044,6 +1201,8 @@ async function generateImage(
   switch (model.api) {
     case "openai-images":
       return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, inputImage, maskImage, signal);
+    case "openrouter-images":
+      return generateViaOpenRouterImages(config, model, prompt, aspectRatio, imageSize, quality, signal);
     case "openai-chat-image":
       return generateViaChatImage(config, model, prompt, aspectRatio, imageSize, signal);
     case "google-generative-ai-image":
@@ -1112,10 +1271,10 @@ const TOOL_PARAMS = Type.Object({
     description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. For edits, defaults to the input image's nearest supported ratio.",
   })),
   imageSize: Type.Optional(Type.String({
-    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. OpenRouter models only.",
+    description: "Image resolution tier: 1K (default), 2K, or 4K. Sent as `resolution` by the openrouter-images API and ignored elsewhere.",
   })),
   quality: Type.Optional(Type.String({
-    description: "Image quality: auto (default), low, medium, high. OpenAI direct only.",
+    description: "Image quality: auto (default), low, medium, high. Sent by the OpenAI Images API for gpt-image/DALL-E models and by the openrouter-images API.",
   })),
   save: Type.Optional(Type.String({
     description: "Save mode: project (default), global, or custom. Images are always saved locally.",
