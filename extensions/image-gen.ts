@@ -9,13 +9,12 @@
  * - Session-persisted selection via pi.appendEntry()
  *
  * API types:
- *   openai-images           — POST /v1/images/generations or /v1/images/edits (OpenAI direct)
- *   openai-chat-image       — POST /v1/chat/completions with image output (OpenRouter)
+ *   openai-images           — POST /v1/images/generations or /v1/images/edits
  *   google-generative-ai-image — POST generateContent with responseModalities (Google)
  */
 
 import { randomUUID, createHash } from "node:crypto";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
@@ -136,10 +135,10 @@ async function saveDefaultModel(provider: string, modelId: string): Promise<void
 // models.json format:
 // {
 //   "providers": {
-//     "openrouter": {
-//       "baseUrl": "https://openrouter.ai/api/v1",
+//     "my-relay": {
+//       "baseUrl": "https://relay.example/v1",
 //       "models": [
-//         { "id": "openai/gpt-5-image", "name": "GPT-5 Image", "output": ["image"] }
+//         { "id": "my-image-model", "name": "My Image Model", "output": ["image"] }
 //       ]
 //     }
 //   }
@@ -184,13 +183,14 @@ interface ModelsJsonConfig {
   providers?: Record<string, ModelsJsonProviderConfig>;
 }
 
-/** Infer legacy image API type from provider name and model api field */
+/** Infer the image API from the provider name and model api field.
+ *
+ * Everything OpenAI-compatible uses `POST /images/generations`, which is the
+ * only OpenAI-style image endpoint this extension speaks. */
 function inferLegacyImageApi(provider: string, apiField?: string): ImageApi {
   if (provider === "google") return "google-generative-ai-image";
-  if (provider === "openrouter") return "openai-chat-image";
-  if (provider === "openai") return "openai-images";
   if (apiField?.includes("google")) return "google-generative-ai-image";
-  return "openai-chat-image";
+  return "openai-images";
 }
 
 function readModelsJson(): Partial<ModelsJsonConfig> {
@@ -250,127 +250,6 @@ function getModelsJsonImageModels(): ImageModel[] {
   return [...models.values()];
 }
 
-// ── Runtime Discovery ──────────────────────────────────────────────
-// On startup, fetch image-capable models from OpenRouter. Results are
-// cached to disk with a 24h TTL so we don't hit the API every launch.
-// Discovery runs non-blocking — if the cache is warm, it's instant.
-// If the fetch fails, we silently fall back to built-in + models.json.
-
-function discoveryCacheDir(): string { return join(getAgentDir(), "cache"); }
-function discoveryCacheFile(): string { return join(discoveryCacheDir(), "pi-image-gen-discovered.json"); }
-const DISCOVERY_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
-
-interface DiscoveryCache {
-  fetchedAt: number;
-  models: ImageModel[];
-}
-
-/** Read cached discovered models if cache is fresh */
-function readDiscoveryCache(): ImageModel[] {
-  const cacheFile = discoveryCacheFile();
-  if (!existsSync(cacheFile)) return [];
-  try {
-    const stat = statSync(cacheFile);
-    const ageMs = Date.now() - stat.mtimeMs;
-    if (ageMs > DISCOVERY_TTL_MS) return []; // Stale
-
-    const cache = JSON.parse(readFileSync(cacheFile, "utf-8")) as DiscoveryCache;
-    return cache.models;
-  } catch {
-    return [];
-  }
-}
-
-/** In-memory store for discovered models (populated on session_start) */
-let discoveredModels: ImageModel[] = readDiscoveryCache();
-
-/** Fetch image models from OpenRouter at runtime and update cache.
- *
- * Uses the frontend API (/api/frontend/models) which includes image-only
- * models (FLUX, Riverflow, Seedream) that the public /v1/models endpoint
- * omits. Falls back to /v1/models if frontend API is unavailable.
- */
-async function refreshDiscoveryCache(): Promise<void> {
-  // Skip if cache is still fresh
-  const cacheFile = discoveryCacheFile();
-  if (existsSync(cacheFile)) {
-    try {
-      const stat = statSync(cacheFile);
-      if (Date.now() - stat.mtimeMs < DISCOVERY_TTL_MS) return;
-    } catch {
-      // Continue to fetch
-    }
-  }
-
-  try {
-    let models: ImageModel[] = [];
-
-    // Try frontend API first — has all image models including image-only ones
-    const frontendResponse = await fetch("https://openrouter.ai/api/frontend/models");
-    if (frontendResponse.ok) {
-      const data = (await frontendResponse.json()) as {
-        data: Array<{
-          slug: string;
-          name: string;
-          output_modalities?: string[];
-        }>;
-      };
-
-      for (const model of data.data) {
-        const outputMods = model.output_modalities ?? [];
-        if (!outputMods.includes("image")) continue;
-        if (model.slug === "openrouter/auto") continue;
-
-        models.push({
-          id: model.slug,
-          name: model.name,
-          provider: "openrouter",
-          baseUrl: "https://openrouter.ai/api/v1",
-          api: "openai-chat-image",
-          cost: 0,
-        });
-      }
-    } else {
-      // Fallback to public /v1/models (fewer image models but stable)
-      const response = await fetch("https://openrouter.ai/api/v1/models");
-      if (!response.ok) return;
-
-      const data = (await response.json()) as {
-        data: Array<{
-          id: string;
-          name: string;
-          architecture?: { output_modalities?: string[] };
-        }>;
-      };
-
-      for (const model of data.data) {
-        const outputMods = model.architecture?.output_modalities ?? [];
-        if (!outputMods.includes("image")) continue;
-        if (model.id === "openrouter/auto") continue;
-
-        models.push({
-          id: model.id,
-          name: model.name,
-          provider: "openrouter",
-          baseUrl: "https://openrouter.ai/api/v1",
-          api: "openai-chat-image",
-          cost: 0,
-        });
-      }
-    }
-
-    // Write cache
-    await mkdir(discoveryCacheDir(), { recursive: true });
-    const cache: DiscoveryCache = { fetchedAt: Date.now(), models };
-    await writeFile(discoveryCacheFile(), JSON.stringify(cache, null, 2));
-
-    // Update in-memory
-    discoveredModels = models;
-  } catch {
-    // Silent failure — we still have built-in + models.json
-  }
-}
-
 /** Read image models from the settings file's providers section. */
 function getSettingsImageModels(config: ExtensionConfig): ImageModel[] {
   if (!config.providers) return [];
@@ -405,11 +284,6 @@ function getAllModels(config: ExtensionConfig): ImageModel[] {
 
   // Built-in generated models (lowest priority)
   for (const m of getBuiltInModels()) {
-    models.set(`${m.provider}/${m.id}`, m);
-  }
-
-  // Runtime-discovered models
-  for (const m of discoveredModels) {
     models.set(`${m.provider}/${m.id}`, m);
   }
 
@@ -898,90 +772,6 @@ async function generateViaOpenAIImages(
   throw new Error(`OpenAI ${operation} returned no image data`);
 }
 
-/** OpenRouter chat completions with image output.
- *
- * Uses `modalities: ["image"]` so image-only endpoints can route successfully.
- * Response includes `message.images[]` with base64 data URLs.
- * See: https://openrouter.ai/docs/features/image-generation
- */
-async function generateViaChatImage(
-  config: ProviderConfig,
-  model: ImageModel,
-  prompt: string,
-  aspectRatio: string,
-  imageSize: string,
-  signal?: AbortSignal,
-): Promise<GeneratedImage> {
-  const body: Record<string, unknown> = {
-    model: model.id,
-    messages: [{ role: "user", content: prompt }],
-    modalities: ["image"],
-  };
-
-  // Add image_config for aspect ratio and size
-  const imageConfig: Record<string, string> = {};
-  if (aspectRatio && aspectRatio !== "1:1") {
-    imageConfig.aspect_ratio = aspectRatio;
-  }
-  if (imageSize && imageSize !== "1K") {
-    imageConfig.image_size = imageSize;
-  }
-  if (Object.keys(imageConfig).length > 0) {
-    body.image_config = imageConfig;
-  }
-
-  const response = await fetch(`${config.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.apiKey}`,
-      "Content-Type": "application/json",
-    },
-    body: JSON.stringify(body),
-    signal,
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`OpenRouter image generation failed (${response.status}): ${errorText}`);
-  }
-
-  const result = (await response.json()) as {
-    choices: Array<{
-      message: {
-        content?: string;
-        images?: Array<{
-          type: string;
-          image_url: { url: string };
-        }>;
-      };
-    }>;
-  };
-
-  const message = result.choices[0]?.message;
-  if (!message) throw new Error("No message in OpenRouter response");
-
-  // Images are in message.images[], each with a base64 data URL
-  if (message.images && message.images.length > 0) {
-    const url = message.images[0].image_url.url;
-    if (url.startsWith("data:")) {
-      const commaIdx = url.indexOf(",");
-      const header = url.slice(0, commaIdx);
-      const data = url.slice(commaIdx + 1);
-      const mimeType = header.match(/data:(.*);/)?.[1] || "image/png";
-      return { data, mimeType };
-    }
-    // URL-based — fetch and convert
-    const imgResponse = await fetch(url, { signal });
-    const buffer = await imgResponse.arrayBuffer();
-    return {
-      data: Buffer.from(buffer).toString("base64"),
-      mimeType: imgResponse.headers.get("content-type") || "image/png",
-    };
-  }
-
-  throw new Error("No images in OpenRouter response. Ensure the model supports image generation.");
-}
-
 /** Google Gemini generateContent with responseModalities: ["IMAGE"] */
 async function generateViaGoogleImage(
   config: ProviderConfig,
@@ -1044,8 +834,6 @@ async function generateImage(
   switch (model.api) {
     case "openai-images":
       return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, inputImage, maskImage, signal);
-    case "openai-chat-image":
-      return generateViaChatImage(config, model, prompt, aspectRatio, imageSize, signal);
     case "google-generative-ai-image":
       return generateViaGoogleImage(config, model, prompt, signal);
     default:
@@ -1084,9 +872,7 @@ function resolveModel(
     if (providerModels.length > 0) return providerModels[0];
   }
 
-  // 4. Default: first openrouter model, then openai, then anything
-  const orModels = allModels.filter((m) => m.provider === "openrouter");
-  if (orModels.length > 0) return orModels[0];
+  // 3. Default: first OpenAI model, then anything
   const openaiModels = allModels.filter((m) => m.provider === "openai");
   if (openaiModels.length > 0) return openaiModels[0];
   if (allModels.length > 0) return allModels[0];
@@ -1112,10 +898,10 @@ const TOOL_PARAMS = Type.Object({
     description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. For edits, defaults to the input image's nearest supported ratio.",
   })),
   imageSize: Type.Optional(Type.String({
-    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. OpenRouter models only.",
+    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. Provider-dependent.",
   })),
   quality: Type.Optional(Type.String({
-    description: "Image quality: auto (default), low, medium, high. OpenAI direct only.",
+    description: "Image quality: auto (default), low, medium, high. Sent for gpt-image/DALL-E models.",
   })),
   save: Type.Optional(Type.String({
     description: "Save mode: project (default), global, or custom. Images are always saved locally.",
@@ -1170,9 +956,6 @@ export default function piImageGen(pi: ExtensionAPI) {
         sessionSelection = { provider: config.defaultProvider, model: config.defaultModel };
       }
     }
-
-    // Runtime discovery — non-blocking, updates cache for this + future sessions
-    refreshDiscoveryCache().catch(() => {});
   });
 
   // ── /image-model command ──
@@ -1206,7 +989,7 @@ export default function piImageGen(pi: ExtensionAPI) {
           const provider = input.slice(0, slashIdx);
           const modelId = input.slice(slashIdx + 1);
           found = allModels.find((m) => m.provider === provider && m.id === modelId);
-          // For openrouter models, the id itself contains slashes (e.g., "openai/gpt-5-image")
+          // Relay model ids may themselves contain slashes (e.g., "openai/gpt-5-image")
           if (!found) {
             found = allModels.find((m) => m.id === input);
           }

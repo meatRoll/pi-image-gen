@@ -6,12 +6,12 @@
 pi install @meatroll/pi-image-gen
 ```
 
-Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports OpenAI, Google, and OpenRouter providers, with runtime discovery of new models from OpenRouter.
+Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native Gemini image API, so any OpenAI-compatible relay works.
 
 ## Features
 
-- 🎨 **20+ built-in models** — OpenAI, Google Gemini, OpenRouter (FLUX, Seedream, Riverflow, and more)
-- 🔄 **Runtime discovery** — Automatically finds new OpenRouter image models on startup
+- 🎨 **Built-in models** — OpenAI (GPT Image, DALL-E) and Google Gemini
+- 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
 - 🖼️ **Aspect ratios & quality** — 1:1, 16:9, 9:16, 4:3, etc. with quality controls
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
@@ -56,7 +56,7 @@ After a region is saved, Pi asks whether to use the suggested prompt or write a 
 
 The selected region(s) are converted to a PNG mask automatically and saved under `.pi/generated-images/`. In non-TUI or headless mode, omitting `maskPath` edits the whole image. Pass `maskPath` only when a mask has already been prepared. For edits, the output aspect ratio defaults to the input image's nearest supported ratio unless `aspectRatio` is set explicitly.
 
-The selected model must use the `openai-images` API type for image editing. OpenRouter chat-image and Google models continue to support text-to-image generation through their existing APIs.
+The selected model must use the `openai-images` API type for image editing. Google models support text-to-image generation through Gemini's native API.
 
 ### Browser mask selector
 
@@ -84,20 +84,19 @@ Use `/image-model` — works in both Pi terminal and Minapi:
 ```
 /image-model                                 # Interactive picker (fuzzy search)
 /image-model openai/gpt-image-1              # Direct selection
-/image-model openrouter/openai/gpt-5-image   # OpenRouter model
+/image-model meatroll/gemini-4-argon        # Relay model
 ```
 
 Selection persists in the session and shows in the status bar as `🎨 provider/model`.
 
 ## Built-in Providers & Models
 
-Models are auto-generated from OpenRouter's API and static catalogs. Run `npm run generate-models` to refresh.
+Models come from the static catalog in `scripts/generate-image-models.ts`. Run `npm run generate-models` to refresh.
 
 | Provider | Models | API Key | API Type |
 |----------|--------|---------|----------|
 | **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` and `/v1/images/edits` |
 | **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | Gemini `generateContent` |
-| **openrouter** | `openai/gpt-5-image`, `openai/gpt-5-image-mini`, `google/gemini-2.5-flash-image`, `google/gemini-3-pro-image-preview`, FLUX.2 variants, Seedream, Riverflow, and more | `OPENROUTER_API_KEY` | Chat completions |
 
 ## Resolution Order
 
@@ -105,7 +104,7 @@ When generating an image, the model is resolved in this order:
 
 1. **Session selection** — `/image-model` command
 2. **Settings file** — `defaultProvider` / `defaultModel` in `pi-image-gen.json`
-3. **Default** — first available OpenRouter model, then OpenAI
+3. **Default** — the first OpenAI model, then anything available
 
 ## Configuration
 
@@ -140,8 +139,7 @@ For providers whose signed image URLs require server-side authentication, set `r
 
 | Type | Used By | Endpoint |
 |------|---------|----------|
-| `openai-images` | OpenAI direct | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
-| `openai-chat-image` | OpenRouter | `POST /v1/chat/completions` with `modalities: ["image"]` |
+| `openai-images` | OpenAI direct and any OpenAI-compatible relay | `POST /v1/images/generations` for text-to-image; `POST /v1/images/edits` when `imagePath` is supplied |
 | `google-generative-ai-image` | Google Gemini | `POST /models/{id}:generateContent` |
 
 Model-level `api` overrides provider-level `api`.
@@ -173,7 +171,7 @@ The `generate_image` tool accepts:
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
 | `aspectRatio` | string | `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
-| `imageSize` | string | `1K` | `1K`, `2K`, `4K` (OpenRouter models only) |
+| `imageSize` | string | `1K` | `1K`, `2K`, `4K` (provider-dependent; not used by the OpenAI Images API) |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |
@@ -194,8 +192,7 @@ Mirrors Pi's text model pipeline:
 | Layer | Pi (text) | pi-image-gen |
 |-------|-----------|--------------|
 | Build-time discovery | `generate-models.ts` → `models.generated.ts` | `generate-image-models.ts` → `image-models.generated.ts` |
-| Runtime discovery | None | OpenRouter `/v1/models` on startup (24h cache) |
-| Sources | models.dev, OpenRouter, AI Gateway | OpenRouter (`output_modalities: ["image"]`), static catalog |
+| Sources | models.dev, OpenRouter, AI Gateway | Static catalog in `generate-image-models.ts` |
 | Custom models | `models.json` providers | `settings/pi-image-gen.json` (preferred) + legacy `models.json` |
 | API key resolution | `ModelRegistry.getApiKeyForProvider()` | Same |
 | Model selection | Ctrl+P / model selector | `/image-model` command |
@@ -203,17 +200,15 @@ Mirrors Pi's text model pipeline:
 ### Model Priority (lowest → highest)
 
 1. **Built-in generated** — `image-models.generated.ts` (baked into package)
-2. **Runtime discovered** — OpenRouter API fetch, cached at `~/.pi/agent/cache/pi-image-gen-discovered.json` (24h TTL)
-3. **Legacy `models.json`** — `providers.<name>.models[]` entries with `output: ["image"]`
-4. **Settings providers** — `providers` in `pi-image-gen.json` settings file
-5. **Session selection** — `/image-model` command or tool params
+2. **Legacy `models.json`** — `providers.<name>.models[]` entries with `output: ["image"]`
+3. **Settings providers** — `providers` in `pi-image-gen.json` settings file
+4. **Session selection** — `/image-model` command or tool params
 
 ## Adding Providers
 
 1. Add static models to `scripts/generate-image-models.ts`
-2. Or add a new dynamic fetch function (like `fetchOpenRouterImageModels`)
-3. Run `npm run generate-models`
-4. Add generation logic in `extensions/image-gen.ts` if a new API type is needed
+2. Run `npm run generate-models`
+3. Add generation logic in `extensions/image-gen.ts` if a new API type is needed
 
 ## License
 
