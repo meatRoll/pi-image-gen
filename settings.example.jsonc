@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// pi-image-gen — complete settings reference
+// pi-image-gen 1.2.0 — complete settings reference
 //
 // This file is documentation, not configuration. The extension parses
 // pi-image-gen.json with JSON.parse, so comments would silently discard the
