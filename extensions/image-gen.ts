@@ -3,8 +3,9 @@
  *
  * Mirrors Pi's text model architecture:
  * - Built-in models from image-models.generated.ts (build-time discovery)
+ * - Image models imported from Pi's models.json into the plugin config via /image-model
  * - Custom models via config files (runtime override)
- * - API keys and base URLs resolved via Pi's ModelRegistry
+ * - API keys and headers resolved from the plugin config first, then Pi's ModelRegistry
  * - /image-model command for interactive model selection (Pi TUI + Minapi)
  * - Session-persisted selection via pi.appendEntry()
  *
@@ -21,9 +22,10 @@ import { promisify } from "node:util";
 import { join, basename, dirname, isAbsolute, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { tmpdir } from "node:os";
-import { getAgentDir, convertToPng, resizeImage } from "@earendil-works/pi-coding-agent";
+import { convertToPng, DynamicBorder, getAgentDir, keyHint, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import {
   Container,
   fuzzyFilter,
@@ -38,6 +40,9 @@ import type { Static } from "typebox";
 import { IMAGE_MODELS, type ImageModel, type ImageApi } from "../lib/image-models.generated.js";
 
 const execFileAsync = promisify(execFile);
+
+/** A chat model as registered by Pi (models.json providers and built-ins). */
+type PiChatModel = Model<Api>;
 
 // ── Image Model Registry ───────────────────────────────────────────
 // Mirrors Pi's ModelRegistry: built-in + custom, with provider-aware lookups.
@@ -77,6 +82,21 @@ type SaveMode = (typeof SAVE_MODES)[number];
 
 const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
 
+/** Image-generation options stored per model in the plugin settings. */
+interface ImageModelOptions {
+  /** OpenAI Images response format. `b64_json` avoids signed media URLs. */
+  responseFormat?: "url" | "b64_json";
+  /** Whether the model exposes POST /images/edits (imagePath/maskPath). */
+  supportsEdit?: boolean;
+  /** Used when the generate_image call omits aspectRatio. */
+  defaultAspectRatio?: string;
+  /** Used when the generate_image call omits imageSize (Gemini only). */
+  defaultImageSize?: string;
+}
+
+/** A catalog model plus the image options declared in the plugin settings. */
+type ResolvedImageModel = ImageModel & ImageModelOptions;
+
 interface ExtensionConfig {
   save?: SaveMode;
   saveDir?: string;
@@ -85,7 +105,8 @@ interface ExtensionConfig {
   /** Image generation timeout in seconds. Default: 600 (10 min). */
   timeout?: number;
   /** Image provider definitions. Each key is a provider name; value defines
-   *  baseUrl, apiKey, api type, and models. Highest-priority model source. */
+   *  baseUrl, apiKey, headers, api type, and models. Models imported from Pi's
+   *  models.json through /image-model are written here. */
   providers?: Record<string, ModelsJsonImageProviderConfig>;
   /** Proxy used by curl when downloading signed Gemini image URLs locally. */
   downloadProxy?: string;
@@ -237,7 +258,8 @@ function loadConfig(cwd: string): ExtensionConfig {
   } as ExtensionConfig;
 }
 
-/** Persist model selection so it survives across sessions. */
+/** Persist the model selection so it survives across sessions. Imported model
+ *  definitions live in the plugin config; this only remembers the last pick. */
 async function saveDefaultModel(provider: string, modelId: string): Promise<void> {
   const path = join(settingsDir(), MODEL_STATE_FILENAME);
   const existing = readJsonFile(path);
@@ -248,10 +270,13 @@ async function saveDefaultModel(provider: string, modelId: string): Promise<void
 }
 
 // ── models.json Integration ────────────────────────────────────────
-// Read Pi's models.json and extract models with output: ["image"].
-// Pi's ajv validation allows additional properties, so users can add
-// `output: ["image"]` to any model definition and Pi ignores it while
-// pi-image-gen picks it up.
+// Pi's models.json is the source for importing image models: /image-model
+// lists the provider's configured chat models, then writes the selected model
+// into the plugin config as a standard providers entry (with the image options
+// Pi has no field for). The state file only remembers the last selection.
+//
+// Legacy support: a model tagged with output: ["image"] is still picked up
+// directly. Pi ignores that field, so it is only a pi-image-gen convention.
 //
 // models.json format:
 // {
@@ -259,7 +284,7 @@ async function saveDefaultModel(provider: string, modelId: string): Promise<void
 //     "my-relay": {
 //       "baseUrl": "https://relay.example/v1",
 //       "models": [
-//         { "id": "my-image-model", "name": "My Image Model", "output": ["image"] }
+//         { "id": "my-image-model", "name": "My Image Model" }
 //       ]
 //     }
 //   }
@@ -282,11 +307,16 @@ interface ModelsJsonImageModelDef {
   name?: string;
   api?: ImageApi;
   cost?: number;
+  responseFormat?: "url" | "b64_json";
+  supportsEdit?: boolean;
+  defaultAspectRatio?: string;
+  defaultImageSize?: string;
 }
 
 interface ModelsJsonProviderConfig {
   baseUrl?: string;
   apiKey?: string;
+  api?: string;
   models?: ModelsJsonModelDef[];
   modelOverrides?: Record<string, { output?: string[]; [key: string]: unknown }>;
 }
@@ -294,6 +324,8 @@ interface ModelsJsonProviderConfig {
 interface ModelsJsonImageProviderConfig {
   baseUrl?: string;
   apiKey?: string;
+  /** Extra request headers, e.g. a relay's User-Agent. */
+  headers?: Record<string, string>;
   api?: ImageApi;
   /** OpenAI Images response format. Use b64_json when the server owns signed-media authentication. */
   responseFormat?: "url" | "b64_json";
@@ -327,12 +359,11 @@ function getModelsJsonApiKeyForProvider(provider: string): string | undefined {
 
 /** Read Pi's models.json and extract image-capable models from the legacy
  *  providers.<provider>.models[] with output:["image"] format. */
-function getModelsJsonImageModels(): ImageModel[] {
-  const raw = readModelsJson();
+function getModelsJsonImageModels(modelsJson: Partial<ModelsJsonConfig> = readModelsJson()): ImageModel[] {
   const models = new Map<string, ImageModel>();
 
-  if (raw.providers) {
-    for (const [provider, config] of Object.entries(raw.providers)) {
+  if (modelsJson.providers) {
+    for (const [provider, config] of Object.entries(modelsJson.providers)) {
       const baseUrl = config.baseUrl || "";
 
       if (config.models) {
@@ -372,9 +403,9 @@ function getModelsJsonImageModels(): ImageModel[] {
 }
 
 /** Read image models from the settings file's providers section. */
-function getSettingsImageModels(config: ExtensionConfig): ImageModel[] {
+function getSettingsImageModels(config: ExtensionConfig): ResolvedImageModel[] {
   if (!config.providers) return [];
-  const models = new Map<string, ImageModel>();
+  const models = new Map<string, ResolvedImageModel>();
 
   for (const [provider, providerConfig] of Object.entries(config.providers)) {
     const baseUrl = providerConfig.baseUrl || "";
@@ -389,6 +420,10 @@ function getSettingsImageModels(config: ExtensionConfig): ImageModel[] {
         baseUrl,
         api: modelDef.api || providerApi,
         cost: modelDef.cost || 0,
+        responseFormat: modelDef.responseFormat,
+        supportsEdit: modelDef.supportsEdit,
+        defaultAspectRatio: modelDef.defaultAspectRatio,
+        defaultImageSize: modelDef.defaultImageSize,
       });
     }
   }
@@ -396,12 +431,47 @@ function getSettingsImageModels(config: ExtensionConfig): ImageModel[] {
   return [...models.values()];
 }
 
-/** Merge model sources, with explicit settings acting as the catalog override. */
-function getAllModels(config: ExtensionConfig): ImageModel[] {
+/** Infer the image API for a model picked from Pi's models.json. Pi stores
+ *  chat APIs there, so the provider name, API and baseUrl are the only hints.
+ *  Anything that does not look like Google is treated as an OpenAI-compatible
+ *  relay that exposes POST /images/generations. */
+function inferPiImageApi(
+  provider: string,
+  providerConfig?: ModelsJsonProviderConfig,
+  modelId?: string,
+): ImageApi {
+  const modelConfig = modelId ? providerConfig?.models?.find((model) => model.id === modelId) : undefined;
+  const hints = `${provider} ${providerConfig?.api ?? ""} ${modelConfig?.api ?? ""} ${providerConfig?.baseUrl ?? ""}`.toLowerCase();
+  if (hints.includes("google")) return "google-generative-ai-image";
+  return "openai-images";
+}
+
+/** Chat models registered by Pi from the user's models.json providers. */
+function getPiRegistryModels(ctx: ExtensionContext): PiChatModel[] {
+  const providers = new Set(Object.keys(readModelsJson().providers ?? {}));
+  if (providers.size === 0) return [];
+  // List every configured model: Pi may not have credentials for it, but the
+  // import can still copy them from the provider config.
+  return ctx.modelRegistry.getAll().filter((model) => providers.has(model.provider));
+}
+
+/** Registry model used to resolve auth, baseUrl and headers for a provider. */
+function findRegistryModel(
+  ctx: ExtensionContext,
+  provider: string,
+  id: string,
+): PiChatModel | undefined {
+  return ctx.modelRegistry.find(provider, id)
+    ?? ctx.modelRegistry.getAll().find((model) => model.provider === provider);
+}
+
+/** Merge model sources, with explicit settings acting as the catalog override.
+ *  Models imported from Pi's models.json are standard settings models. */
+function getAllModels(config: ExtensionConfig): ResolvedImageModel[] {
   const configuredModels = getSettingsImageModels(config);
   if (configuredModels.length > 0) return configuredModels;
 
-  const models = new Map<string, ImageModel>();
+  const models = new Map<string, ResolvedImageModel>();
 
   // Built-in generated models (lowest priority)
   for (const m of getBuiltInModels()) {
@@ -414,6 +484,93 @@ function getAllModels(config: ExtensionConfig): ImageModel[] {
   }
 
   return [...models.values()];
+}
+
+// ── Import from Pi's models.json ───────────────────────────────────
+
+/** Read the target settings file for mutation. A file that exists but cannot
+ *  be parsed is never overwritten. */
+function readSettingsForUpdate(path: string): Record<string, unknown> {
+  if (!existsSync(path)) return {};
+  const text = readFileSync(path, "utf-8");
+  try {
+    const parsed = JSON.parse(stripJsonc(text)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error("expected a JSON object");
+    }
+    return parsed as Record<string, unknown>;
+  } catch (error) {
+    throw new Error(
+      `Cannot update ${path}: ${error instanceof Error ? error.message : String(error)}. Fix the file and try again.`,
+    );
+  }
+}
+
+interface ImportedModelSource {
+  baseUrl?: string;
+  apiKey?: string;
+  headers?: Record<string, string>;
+}
+
+/** Add or replace a model as a standard providers.<provider>.models[] entry in
+ *  the global plugin settings, copying credentials and headers from Pi. The
+ *  resulting entry is managed independently of Pi's models.json. */
+async function importImageModelIntoSettings(
+  provider: string,
+  modelId: string,
+  modelName: string | undefined,
+  options: ImageModelOptions & { api: ImageApi },
+  source: ImportedModelSource,
+): Promise<string> {
+  const path = globalConfigPath();
+  const raw = readSettingsForUpdate(path);
+  const providers = { ...((raw.providers as Record<string, unknown> | undefined) ?? {}) };
+  const existingProvider = { ...((providers[provider] as Record<string, unknown> | undefined) ?? {}) };
+  const existingModels = Array.isArray(existingProvider.models)
+    ? [...(existingProvider.models as Record<string, unknown>[])]
+    : [];
+  const index = existingModels.findIndex((model) => model?.id === modelId);
+
+  const nextModel: Record<string, unknown> = {
+    ...(index >= 0 ? existingModels[index] : {}),
+    id: modelId,
+    api: options.api,
+  };
+  if (modelName) nextModel.name = modelName;
+  else if (typeof nextModel.name !== "string") nextModel.name = modelId;
+
+  if (options.api === "openai-images") {
+    nextModel.responseFormat = options.responseFormat ?? "url";
+    nextModel.supportsEdit = options.supportsEdit ?? true;
+  } else {
+    delete nextModel.responseFormat;
+    delete nextModel.supportsEdit;
+  }
+  if (options.defaultAspectRatio) nextModel.defaultAspectRatio = options.defaultAspectRatio;
+  else delete nextModel.defaultAspectRatio;
+  if (options.defaultImageSize) nextModel.defaultImageSize = options.defaultImageSize;
+  else delete nextModel.defaultImageSize;
+
+  if (index >= 0) existingModels[index] = nextModel;
+  else existingModels.push(nextModel);
+
+  const existingHeaders = (existingProvider.headers as Record<string, string> | undefined) ?? {};
+  const nextProvider: Record<string, unknown> = {
+    ...existingProvider,
+    baseUrl: source.baseUrl || existingProvider.baseUrl || "",
+    api: existingProvider.api ?? options.api,
+    models: existingModels,
+  };
+  if (source.apiKey) nextProvider.apiKey = source.apiKey;
+  if (source.headers && Object.keys(source.headers).length > 0) {
+    nextProvider.headers = { ...existingHeaders, ...source.headers };
+  }
+
+  providers[provider] = nextProvider;
+  const nextConfig = { ...raw, providers };
+  await mkdir(settingsDir(), { recursive: true });
+  await writeFile(path, `${JSON.stringify(nextConfig, null, 2)}\n`);
+  return path;
 }
 
 // ── Save Logic ─────────────────────────────────────────────────────
@@ -471,47 +628,84 @@ function normalizeLocalMarkdownLinks(text: string): string {
 interface ProviderConfig {
   apiKey: string;
   baseUrl: string;
+  /** Provider headers resolved by Pi, e.g. a relay's User-Agent or extra auth. */
+  headers?: Record<string, string>;
   downloadProxy?: string;
   responseFormat?: "url" | "b64_json";
 }
 
+function trimBaseUrl(baseUrl: string): string {
+  return baseUrl.replace(/\/+$/, "");
+}
+
+/** Drop null/empty header values so they can be spread into a fetch init. */
+function providerHeadersToRecord(
+  headers: Record<string, string | null> | undefined,
+): Record<string, string> | undefined {
+  if (!headers) return undefined;
+  const record: Record<string, string> = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (typeof value === "string" && value.length > 0) record[key] = value;
+  }
+  return Object.keys(record).length > 0 ? record : undefined;
+}
+
 async function resolveProviderConfig(
-  imageModel: ImageModel,
+  imageModel: ResolvedImageModel,
   ctx: ExtensionContext,
   config: ExtensionConfig,
 ): Promise<ProviderConfig> {
-  // Resolution order: Pi's ModelRegistry → settings providers → models.json providers
-  let apiKey = await ctx.modelRegistry.getApiKeyForProvider(imageModel.provider);
-  if (!apiKey) {
-    apiKey = config.providers?.[imageModel.provider]?.apiKey;
+  const settingsProvider = config.providers?.[imageModel.provider];
+  const registryModel = findRegistryModel(ctx, imageModel.provider, imageModel.id);
+
+  let apiKey: string | undefined;
+  let registryBaseUrl: string | undefined;
+  let registryHeaders: Record<string, string> | undefined;
+  let registryError: string | undefined;
+
+  // Values declared in the plugin settings win; Pi fills the gaps. Copied
+  // credentials and headers keep imported models independent of later changes
+  // in Pi's models.json.
+  const needsRegistry = !settingsProvider?.apiKey || !settingsProvider.baseUrl || !settingsProvider.headers;
+  if (needsRegistry) {
+    if (registryModel) {
+      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(registryModel);
+      if (auth.ok) {
+        registryBaseUrl = auth.baseUrl;
+        registryHeaders = providerHeadersToRecord(auth.headers);
+        if (!settingsProvider?.apiKey) apiKey = auth.apiKey;
+      } else {
+        registryError = auth.error;
+      }
+    }
   }
-  if (!apiKey) {
-    apiKey = getModelsJsonApiKeyForProvider(imageModel.provider);
+  if (!apiKey && !settingsProvider?.apiKey) {
+    apiKey = await ctx.modelRegistry.getApiKeyForProvider(imageModel.provider);
   }
-  if (!apiKey) {
+  apiKey ||= settingsProvider?.apiKey;
+  apiKey ||= getModelsJsonApiKeyForProvider(imageModel.provider);
+
+  const headers = settingsProvider?.headers ?? registryHeaders;
+
+  if (!apiKey && !headers) {
+    const detail = registryError ? ` Pi reported: ${registryError}.` : "";
     throw new Error(
-      `No API key for provider "${imageModel.provider}". ` +
-      `Set it in environment, /login, or add apiKey to providers.${imageModel.provider} in ~/.pi/agent/settings/pi-image-gen.json.`,
+      `No credentials for provider "${imageModel.provider}".${detail} ` +
+      `Set them in environment, /login, ~/.pi/agent/models.json, or add apiKey to providers.${imageModel.provider} in ~/.pi/agent/settings/pi-image-gen.json.`,
     );
   }
 
-  // Use model's baseUrl, or fall back to Pi's registry for the provider
-  let baseUrl = imageModel.baseUrl;
-  if (!baseUrl) {
-    const allModels = ctx.modelRegistry.getAll();
-    const textModel = allModels.find((m) => m.provider === imageModel.provider);
-    baseUrl = textModel?.baseUrl || "";
-  }
-
+  const baseUrl = settingsProvider?.baseUrl || registryBaseUrl || imageModel.baseUrl || registryModel?.baseUrl || "";
   if (!baseUrl) {
     throw new Error(`No base URL for provider "${imageModel.provider}".`);
   }
 
   return {
-    apiKey,
-    baseUrl,
+    apiKey: apiKey ?? "",
+    baseUrl: trimBaseUrl(baseUrl),
+    headers,
     downloadProxy: config.downloadProxy,
-    responseFormat: config.providers?.[imageModel.provider]?.responseFormat,
+    responseFormat: imageModel.responseFormat ?? settingsProvider?.responseFormat,
   };
 }
 
@@ -892,7 +1086,8 @@ async function generateViaOpenAIImages(
   const operation = inputImage ? "image edit" : "image generation";
   const endpoint = inputImage ? "edits" : "generations";
   const headers: Record<string, string> = {
-    Authorization: `Bearer ${config.apiKey}`,
+    ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
+    ...config.headers,
   };
   let requestBody: string | FormData;
 
@@ -991,7 +1186,7 @@ async function generateViaImagenPredict(
     `${config.baseUrl}/models/${model.id}:predict?key=${config.apiKey}`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...config.headers },
       body: JSON.stringify({ instances: [{ prompt }], parameters }),
       signal,
     },
@@ -1035,7 +1230,7 @@ async function generateViaGeminiGenerateContent(
     `${config.baseUrl}/models/${model.id}:generateContent?key=${config.apiKey}`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", ...config.headers },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
         generationConfig,
@@ -1103,7 +1298,7 @@ interface ModelSelection {
 function resolveModel(
   sessionSelection: ModelSelection | null,
   config: ExtensionConfig,
-): ImageModel {
+): ResolvedImageModel {
   const allModels = getAllModels(config);
 
   // 1. Session selection (set via /image-model)
@@ -1147,10 +1342,10 @@ const TOOL_PARAMS = Type.Object({
     description: "Optional prepared mask image for local editing. Requires imagePath. Omit this to be asked whether to select an area interactively.",
   })),
   aspectRatio: Type.Optional(Type.String({
-    description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. For edits, defaults to the input image's nearest supported ratio.",
+    description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. Uses the model's saved default when omitted. For edits, defaults to the input image's nearest supported ratio.",
   })),
   imageSize: Type.Optional(Type.String({
-    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. Provider-dependent.",
+    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. Uses the model's saved default when omitted. Provider-dependent.",
   })),
   quality: Type.Optional(Type.String({
     description: "Image quality: auto (default), low, medium, high. Sent for gpt-image/DALL-E models.",
@@ -1167,6 +1362,254 @@ const TOOL_PARAMS = Type.Object({
 });
 
 type ToolParams = Static<typeof TOOL_PARAMS>;
+
+// ── Model Picker & Import ────────────────────────────────────────
+
+/** One row in /image-model. A row can come from Pi's models.json registry,
+ *  the plugin catalog, or both (same provider/model). */
+interface ImageModelPickItem {
+  key: string;
+  provider: string;
+  id: string;
+  name: string;
+  piModel?: PiChatModel;
+  catalogModel?: ResolvedImageModel;
+  /** The model is already declared in the plugin's providers. */
+  inConfig: boolean;
+}
+
+const ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4", "21:9"] as const;
+
+/** Show the model name only when it adds words the ID does not. */
+function modelNameSuffix(id: string, name?: string): string | undefined {
+  const trimmed = name?.trim();
+  if (!trimmed) return undefined;
+  const words = (value: string) => value.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
+  const idWords = words(id);
+  const idSet = new Set(idWords);
+  const compactId = idWords.join("");
+  const covered = (word: string) => idSet.has(word) || (word.length > 1 && compactId.includes(word));
+  return words(trimmed).every(covered) ? undefined : trimmed;
+}
+
+function imageModelDetail(model: ResolvedImageModel): string {
+  const parts: string[] = [model.api];
+  if (model.api === "openai-images") {
+    if (model.responseFormat) parts.push(model.responseFormat);
+    if (model.supportsEdit === false) parts.push("no editing");
+  }
+  if (model.defaultAspectRatio) parts.push(model.defaultAspectRatio);
+  if (model.defaultImageSize) parts.push(model.defaultImageSize);
+  return parts.join(" · ");
+}
+
+function isModelInPluginConfig(config: ExtensionConfig, provider: string, id: string): boolean {
+  return Boolean(config.providers?.[provider]?.models?.some((model) => model.id === id));
+}
+
+/** Merge the plugin catalog with the chat models Pi loaded from models.json. */
+function buildImageModelPickItems(ctx: ExtensionContext, config: ExtensionConfig): ImageModelPickItem[] {
+  const items = new Map<string, ImageModelPickItem>();
+
+  for (const model of getAllModels(config)) {
+    const key = `${model.provider}/${model.id}`;
+    items.set(key, {
+      key,
+      provider: model.provider,
+      id: model.id,
+      name: model.name,
+      catalogModel: model,
+      inConfig: isModelInPluginConfig(config, model.provider, model.id),
+    });
+  }
+
+  for (const model of getPiRegistryModels(ctx)) {
+    const key = `${model.provider}/${model.id}`;
+    const existing = items.get(key);
+    if (existing) {
+      existing.piModel = model;
+      if (!existing.catalogModel && existing.name === existing.id && model.name) existing.name = model.name;
+    } else {
+      items.set(key, {
+        key,
+        provider: model.provider,
+        id: model.id,
+        name: model.name || model.id,
+        piModel: model,
+        inConfig: isModelInPluginConfig(config, model.provider, model.id),
+      });
+    }
+  }
+
+  return [...items.values()];
+}
+
+interface SelectOption<T> {
+  label: string;
+  value: T;
+}
+
+/** Ask a select question; undefined means the user canceled. */
+async function askOption<T>(
+  ctx: ExtensionContext,
+  title: string,
+  options: SelectOption<T>[],
+): Promise<{ value: T } | undefined> {
+  const choice = await ctx.ui.select(title, options.map((option) => option.label));
+  if (choice === undefined) return undefined;
+  const found = options.find((option) => option.label === choice);
+  return found ? { value: found.value } : undefined;
+}
+
+/** Put the current or inferred choice first so Enter accepts it. */
+function preferredFirst<T>(options: SelectOption<T>[], current: T): SelectOption<T>[] {
+  return [...options].sort((a, b) => Number(b.value === current) - Number(a.value === current));
+}
+
+type ImageModelSetup = ImageModelOptions & { api: ImageApi };
+
+/** Ask for the image options written into the plugin config. */
+async function configureImportedImageModel(
+  ctx: ExtensionContext,
+  item: ImageModelPickItem,
+  existing: ImageModelSetup | undefined,
+): Promise<ImageModelSetup | undefined> {
+  const providerConfig = readModelsJson().providers?.[item.provider];
+  const inferredApi = existing?.api ?? inferPiImageApi(item.provider, providerConfig, item.id);
+  const title = (label: string) => `${label} — ${item.provider}/${item.id}`;
+
+  // Headless modes apply the defaults; there is no one to ask.
+  if (!ctx.hasUI) {
+    return {
+      api: inferredApi,
+      ...(inferredApi === "openai-images"
+        ? { responseFormat: existing?.responseFormat ?? "url", supportsEdit: existing?.supportsEdit ?? true }
+        : {}),
+      ...(existing?.defaultAspectRatio ? { defaultAspectRatio: existing.defaultAspectRatio } : {}),
+      ...(existing?.defaultImageSize ? { defaultImageSize: existing.defaultImageSize } : {}),
+    };
+  }
+
+  const apiOptions: SelectOption<ImageApi>[] = [
+    { label: "openai-images (OpenAI-compatible /images/generations)", value: "openai-images" },
+    { label: "google-generative-ai-image (Gemini generateContent / Imagen predict)", value: "google-generative-ai-image" },
+  ];
+  const api = await askOption<ImageApi>(ctx, title("Image API"), preferredFirst(apiOptions, inferredApi));
+  if (!api) return undefined;
+
+  let responseFormat: "url" | "b64_json" = existing?.responseFormat ?? "url";
+  let supportsEdit = existing?.supportsEdit ?? true;
+  if (api.value === "openai-images") {
+    const format = await askOption(ctx, title("Response format"), preferredFirst([
+      { label: "url — server returns an image link (or data URL)", value: "url" as const },
+      { label: "b64_json — server returns image bytes", value: "b64_json" as const },
+    ], responseFormat));
+    if (!format) return undefined;
+    responseFormat = format.value;
+
+    const edit = await askOption<boolean>(ctx, title("Image editing"), preferredFirst([
+      { label: "Yes — supports /images/edits (imagePath, maskPath)", value: true },
+      { label: "No — text-to-image only", value: false },
+    ], supportsEdit));
+    if (!edit) return undefined;
+    supportsEdit = edit.value;
+  }
+
+  const aspectOptions: SelectOption<string | null>[] = [
+    { label: "Not set — the tool decides per request", value: null },
+    ...ASPECT_RATIO_OPTIONS.map((value) => ({ label: value, value })),
+  ];
+  const aspect = await askOption(
+    ctx,
+    title("Default aspect ratio"),
+    preferredFirst(aspectOptions, existing?.defaultAspectRatio ?? null),
+  );
+  if (!aspect) return undefined;
+
+  let defaultImageSize: string | undefined;
+  if (api.value === "google-generative-ai-image") {
+    const sizeOptions: SelectOption<string | null>[] = [
+      { label: "Not set — use the model default (1K)", value: null },
+      { label: "1K", value: "1K" },
+      { label: "2K", value: "2K" },
+      { label: "4K", value: "4K" },
+    ];
+    const size = await askOption(
+      ctx,
+      title("Default image size"),
+      preferredFirst(sizeOptions, existing?.defaultImageSize ?? null),
+    );
+    if (!size) return undefined;
+    defaultImageSize = size.value ?? undefined;
+  }
+
+  return {
+    api: api.value,
+    ...(api.value === "openai-images" ? { responseFormat, supportsEdit } : {}),
+    ...(aspect.value != null ? { defaultAspectRatio: aspect.value } : {}),
+    ...(defaultImageSize ? { defaultImageSize } : {}),
+  };
+}
+
+/** Credentials and headers copied from Pi into the plugin config. */
+async function readImportSource(ctx: ExtensionContext, item: ImageModelPickItem): Promise<ImportedModelSource> {
+  if (!item.piModel) return {};
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(item.piModel);
+  const apiKey = auth.ok && auth.apiKey
+    ? auth.apiKey
+    : await ctx.modelRegistry.getApiKeyForProvider(item.provider);
+  return {
+    baseUrl: (auth.ok ? auth.baseUrl : undefined) || item.piModel.baseUrl,
+    apiKey,
+    headers: auth.ok ? providerHeadersToRecord(auth.headers) : undefined,
+  };
+}
+
+/** Add the picked Pi model to the plugin config, asking for its options first.
+ *  Returns false when the user canceled the wizard. */
+async function importPickedImageModel(
+  ctx: ExtensionContext,
+  config: ExtensionConfig,
+  item: ImageModelPickItem,
+): Promise<boolean> {
+  if (!item.piModel) return true;
+
+  const existing = item.catalogModel;
+  const existingOptions: ImageModelSetup | undefined = existing
+    ? {
+        api: existing.api,
+        responseFormat: existing.responseFormat,
+        supportsEdit: existing.supportsEdit,
+        defaultAspectRatio: existing.defaultAspectRatio,
+        defaultImageSize: existing.defaultImageSize,
+      }
+    : undefined;
+
+  if (item.inConfig && existingOptions) {
+    if (!ctx.hasUI) return true;
+    const keep = "Keep the current configuration";
+    const choice = await ctx.ui.select(
+      `${item.provider}/${item.id} is in pi-image-gen.json (${imageModelDetail(existing!)})`,
+      [keep, "Reconfigure and re-import"],
+    );
+    if (choice === undefined) return false;
+    if (choice === keep) return true;
+  }
+
+  const options = await configureImportedImageModel(ctx, item, existingOptions);
+  if (!options) return false;
+
+  const source = await readImportSource(ctx, item);
+  const path = await importImageModelIntoSettings(item.provider, item.id, item.name, options, source);
+  ctx.ui.notify(`Wrote ${item.provider}/${item.id} to ${path}.`, "info");
+  if (!config.providers) {
+    ctx.ui.notify(
+      "Providers replace the built-in catalog; add any built-in providers you still want to keep.",
+      "warning",
+    );
+  }
+  return true;
+}
 
 // ── Extension Entry Point ──────────────────────────────────────────
 
@@ -1208,174 +1651,217 @@ export default function piImageGen(pi: ExtensionAPI) {
         sessionSelection = { provider: config.defaultProvider, model: config.defaultModel };
       }
     }
+    ctx.ui.setStatus(
+      "image-model",
+      sessionSelection ? `🎨 ${sessionSelection.provider}/${sessionSelection.model}` : undefined,
+    );
   });
 
   // ── /image-model command ──
 
   pi.registerCommand("image-model", {
-    description: "Select the default image generation model",
+    description: "Select the image generation model from Pi's models.json",
 
     getArgumentCompletions(prefix: string) {
       const config = loadConfig(process.cwd());
-      const models = getAllModels(config);
-      return models
-        .map((m) => `${m.provider}/${m.id}`)
+      const candidates = new Map<string, { provider: string; id: string; name: string }>();
+      for (const model of getAllModels(config)) {
+        candidates.set(`${model.provider}/${model.id}`, { provider: model.provider, id: model.id, name: model.name });
+      }
+      for (const [provider, providerConfig] of Object.entries(readModelsJson().providers ?? {})) {
+        for (const model of providerConfig.models ?? []) {
+          const key = `${provider}/${model.id}`;
+          if (!candidates.has(key)) {
+            candidates.set(key, { provider, id: model.id, name: model.name || model.id });
+          }
+        }
+      }
+      return [...candidates.values()]
+        .map((model) => `${model.provider}/${model.id}`)
         .filter((label) => label.startsWith(prefix))
+        .sort((a, b) => a.localeCompare(b))
         .map((label) => {
-          const model = models.find((m) => `${m.provider}/${m.id}` === label)!;
+          const model = candidates.get(label)!;
           return { value: label, label: `${model.name} (${model.provider})` };
         });
     },
 
     async handler(args: string, ctx) {
       const config = loadConfig(ctx.cwd);
-      const allModels = getAllModels(config);
+      const saveSelection = async (item: ImageModelPickItem) => {
+        sessionSelection = { provider: item.provider, model: item.id };
+        pi.appendEntry(SESSION_ENTRY_TYPE, sessionSelection);
+        await saveDefaultModel(item.provider, item.id);
+        ctx.ui.setStatus("image-model", `🎨 ${item.provider}/${item.id}`);
+        ctx.ui.notify(`Image model: ${item.name} (${item.provider}/${item.id})`, "info");
+      };
 
-      // Direct selection: /image-model openai/gpt-image-1
+      // Direct selection: /image-model meatroll/gemini-4-argon
       if (args.trim()) {
         const input = args.trim();
-        // Try "provider/model" format
-        const slashIdx = input.indexOf("/");
-        let found: ImageModel | undefined;
-        if (slashIdx > 0) {
-          const provider = input.slice(0, slashIdx);
-          const modelId = input.slice(slashIdx + 1);
-          found = allModels.find((m) => m.provider === provider && m.id === modelId);
-          // Relay model ids may themselves contain slashes (e.g., "openai/gpt-5-image")
-          if (!found) {
-            found = allModels.find((m) => m.id === input);
+        const items = buildImageModelPickItems(ctx, config);
+        let found = items.find((item) => item.key === input);
+        if (!found) {
+          // Model ids may contain slashes ("z-ai/glm-5.3"), so match the full input too.
+          const byId = items.filter((item) => item.id === input);
+          if (byId.length === 1) found = byId[0];
+          else if (byId.length > 1) {
+            ctx.ui.notify(
+              `Model "${input}" exists in several providers: ${byId.map((item) => item.provider).join(", ")}. Use provider/model.`,
+              "error",
+            );
+            return;
           }
-        } else {
-          // Try just model id
-          found = allModels.find((m) => m.id === input);
         }
-
         if (!found) {
           ctx.ui.notify(`Unknown image model "${input}". Run /image-model to see options.`, "error");
           return;
         }
 
-        sessionSelection = { provider: found.provider, model: found.id };
-        pi.appendEntry(SESSION_ENTRY_TYPE, sessionSelection);
-        await saveDefaultModel(found.provider, found.id);
-        ctx.ui.setStatus("image-model", undefined);
-        ctx.ui.notify(`Image model: ${found.name} (${found.provider}/${found.id})`, "info");
+        const imported = await importPickedImageModel(ctx, config, found);
+        if (!imported) {
+          ctx.ui.notify("Image model import canceled.", "warning");
+          return;
+        }
+        await saveSelection(found);
         return;
       }
 
-      // Interactive selection with search — mirrors Pi's /model UI
+      // Interactive selection — mirrors Pi's /model selector.
       const currentKey = sessionSelection ? `${sessionSelection.provider}/${sessionSelection.model}` : null;
-
-      // Sort: current model first, then alphabetically by provider
-      const sortedModels = [...allModels].sort((a, b) => {
-        const aIsCurrent = `${a.provider}/${a.id}` === currentKey;
-        const bIsCurrent = `${b.provider}/${b.id}` === currentKey;
-        if (aIsCurrent && !bIsCurrent) return -1;
-        if (!aIsCurrent && bIsCurrent) return 1;
-        return a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
+      const defaultKey = config.defaultProvider && config.defaultModel
+        ? `${config.defaultProvider}/${config.defaultModel}`
+        : null;
+      const sortedItems = buildImageModelPickItems(ctx, config).sort((a, b) => {
+        const rank = (item: ImageModelPickItem) =>
+          item.key === currentKey ? 0 : item.key === defaultKey ? 1 : item.inConfig ? 2 : 3;
+        return rank(a) - rank(b) || a.provider.localeCompare(b.provider) || a.id.localeCompare(b.id);
       });
+      const piProviderCount = new Set(sortedItems.filter((item) => item.piModel).map((item) => item.provider)).size;
 
-      const selected = await ctx.ui.custom<ImageModel | undefined>((tui, theme, _kb, done) => {
+      const selected = await ctx.ui.custom<ImageModelPickItem | undefined>((tui, theme, _kb, done) => {
         const searchInput = new Input();
         searchInput.focused = true;
         const listContainer = new Container();
-        const previewText = new Text("", 1, 0);
-        let filteredModels = sortedModels;
+        let filteredItems = sortedItems;
         let selectedIndex = 0;
         const kb = getKeybindings();
-
-        // Thin border that spans viewport width, matching Pi's DynamicBorder
-        const border = { render: (w: number) => [theme.fg("border", "─".repeat(Math.max(1, w)))], invalidate() {} };
 
         function updateList() {
           listContainer.clear();
           const maxVisible = 10;
           const startIndex = Math.max(
             0,
-            Math.min(selectedIndex - Math.floor(maxVisible / 2), filteredModels.length - maxVisible),
+            Math.min(selectedIndex - Math.floor(maxVisible / 2), filteredItems.length - maxVisible),
           );
-          const endIndex = Math.min(startIndex + maxVisible, filteredModels.length);
+          const endIndex = Math.min(startIndex + maxVisible, filteredItems.length);
 
           for (let i = startIndex; i < endIndex; i++) {
-            const item = filteredModels[i];
+            const item = filteredItems[i];
             if (!item) continue;
             const isHighlighted = i === selectedIndex;
-            const isCurrent = `${item.provider}/${item.id}` === currentKey;
+            const isCurrent = item.key === currentKey;
+            const isDefault = item.key === defaultKey;
+            const cursor = isHighlighted ? theme.fg("accent", "→ ") : "  ";
+            const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
+            const idText = isHighlighted ? theme.fg("accent", item.id) : item.id;
+            const name = modelNameSuffix(item.id, item.name);
+            const nameText = name ? theme.fg("muted", ` (${name})`) : "";
             const providerBadge = theme.fg("muted", ` [${item.provider}]`);
-            const checkmark = isCurrent ? theme.fg("success", " ✓") : "";
-
-            const line = isHighlighted
-              ? `${theme.fg("accent", "→ ")}${theme.fg("accent", item.id)}${providerBadge}${checkmark}`
-              : `  ${item.id}${providerBadge}${checkmark}`;
-            listContainer.addChild(new Text(line, 0, 0));
-          }
-
-          if (filteredModels.length > maxVisible) {
+            const configuredBadge = item.inConfig ? theme.fg("success", " · in config") : "";
+            const defaultBadge = isDefault ? theme.fg("muted", " · default") : "";
             listContainer.addChild(
-              new Text(theme.fg("muted", `  (${selectedIndex + 1}/${filteredModels.length})`), 0, 0),
+              new Text(
+                `${cursor}${currentMarker}${idText}${nameText} ${providerBadge}${configuredBadge}${defaultBadge}`,
+                0,
+                0,
+              ),
             );
           }
 
-          if (filteredModels.length === 0) {
+          if (startIndex > 0 || endIndex < filteredItems.length) {
+            listContainer.addChild(
+              new Text(theme.fg("muted", `  (${selectedIndex + 1}/${filteredItems.length})`), 0, 0),
+            );
+          }
+
+          if (filteredItems.length === 0) {
             listContainer.addChild(new Text(theme.fg("muted", "  No matching models"), 0, 0));
+          } else {
+            const item = filteredItems[selectedIndex];
+            if (item) {
+              listContainer.addChild(new Spacer(1));
+              listContainer.addChild(new Text(theme.fg("muted", `  Model Name: ${item.name}`), 0, 0));
+              if (item.catalogModel) {
+                listContainer.addChild(
+                  new Text(theme.fg("muted", `  Image: ${imageModelDetail(item.catalogModel)}`), 0, 0),
+                );
+              } else if (item.piModel) {
+                listContainer.addChild(
+                  new Text(theme.fg("muted", "  Image: not in pi-image-gen.json — select to configure and import"), 0, 0),
+                );
+              }
+            }
           }
         }
 
-        function updatePreview() {
-          const model = filteredModels[selectedIndex];
-          previewText.setText(model ? theme.fg("muted", `Model Name: ${model.name}`) : "");
-        }
-
-        function filterModels(query: string) {
-          filteredModels = query
-            ? fuzzyFilter(sortedModels, query, (m) => `${m.id} ${m.provider} ${m.name}`)
-            : sortedModels;
-          selectedIndex = Math.min(selectedIndex, Math.max(0, filteredModels.length - 1));
+        function filterItems(query: string) {
+          filteredItems = query
+            ? fuzzyFilter(
+                sortedItems,
+                query,
+                (item) => `${item.provider} ${item.provider}/${item.id} ${item.provider} ${item.id} ${item.name}`,
+              )
+            : sortedItems;
+          selectedIndex = query ? 0 : Math.min(selectedIndex, Math.max(0, filteredItems.length - 1));
           updateList();
-          updatePreview();
         }
 
         searchInput.onSubmit = () => {
-          if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
+          if (filteredItems[selectedIndex]) done(filteredItems[selectedIndex]);
         };
 
+        const sourceHint = piProviderCount > 0
+          ? `Models from ~/.pi/agent/models.json (${piProviderCount} provider${piProviderCount === 1 ? "" : "s"}) plus the plugin catalog. Pick one, then choose its image options.`
+          : "No custom providers in ~/.pi/agent/models.json; showing the plugin catalog.";
+
         const container = new Container();
-        container.addChild(border);
+        container.addChild(new DynamicBorder());
         container.addChild(new Spacer(1));
-        container.addChild(new Text(theme.fg("accent", "Select image model"), 1, 0));
+        container.addChild(new Text(theme.fg(piProviderCount > 0 ? "muted" : "warning", sourceHint), 0, 0));
         container.addChild(new Spacer(1));
         container.addChild(searchInput);
         container.addChild(new Spacer(1));
         container.addChild(listContainer);
         container.addChild(new Spacer(1));
-        container.addChild(previewText);
-        container.addChild(new Spacer(1));
-        container.addChild(border);
+        container.addChild(new Text(
+          `${keyHint("tui.select.confirm", "select")} ${theme.fg("dim", "·")} ${keyHint("tui.select.cancel", "cancel")}`,
+          0,
+          0,
+        ));
+        container.addChild(new DynamicBorder());
 
         updateList();
-        updatePreview();
 
         return {
           render(width: number) { return container.render(width); },
           invalidate() { container.invalidate(); },
           handleInput(data: string) {
             if (kb.matches(data, "tui.select.up")) {
-              if (filteredModels.length === 0) return;
-              selectedIndex = selectedIndex === 0 ? filteredModels.length - 1 : selectedIndex - 1;
+              if (filteredItems.length === 0) return;
+              selectedIndex = selectedIndex === 0 ? filteredItems.length - 1 : selectedIndex - 1;
               updateList();
-              updatePreview();
             } else if (kb.matches(data, "tui.select.down")) {
-              if (filteredModels.length === 0) return;
-              selectedIndex = selectedIndex === filteredModels.length - 1 ? 0 : selectedIndex + 1;
+              if (filteredItems.length === 0) return;
+              selectedIndex = selectedIndex === filteredItems.length - 1 ? 0 : selectedIndex + 1;
               updateList();
-              updatePreview();
             } else if (kb.matches(data, "tui.select.confirm")) {
-              if (filteredModels[selectedIndex]) done(filteredModels[selectedIndex]);
+              if (filteredItems[selectedIndex]) done(filteredItems[selectedIndex]);
             } else if (kb.matches(data, "tui.select.cancel")) {
               done(undefined);
             } else {
               searchInput.handleInput(data);
-              filterModels(searchInput.getValue());
+              filterItems(searchInput.getValue());
             }
             tui.requestRender();
           },
@@ -1384,11 +1870,12 @@ export default function piImageGen(pi: ExtensionAPI) {
 
       if (!selected) return;
 
-      sessionSelection = { provider: selected.provider, model: selected.id };
-      pi.appendEntry(SESSION_ENTRY_TYPE, sessionSelection);
-      await saveDefaultModel(selected.provider, selected.id);
-      ctx.ui.setStatus("image-model", undefined);
-      ctx.ui.notify(`Image model: ${selected.name} (${selected.provider}/${selected.id})`, "info");
+      const imported = await importPickedImageModel(ctx, config, selected);
+      if (!imported) {
+        ctx.ui.notify("Image model import canceled.", "warning");
+        return;
+      }
+      await saveSelection(selected);
     },
   });
 
@@ -1412,8 +1899,9 @@ export default function piImageGen(pi: ExtensionAPI) {
     ): Promise<AgentToolResult<unknown>> {
       const config = loadConfig(ctx.cwd);
       const imageModel = resolveModel(sessionSelection, config);
-      let aspectRatio = params.aspectRatio || "1:1";
-      const imageSize = params.imageSize || "1K";
+      const supportsEdit = imageModel.supportsEdit ?? imageModel.api === "openai-images";
+      let aspectRatio = params.aspectRatio || imageModel.defaultAspectRatio || "1:1";
+      const imageSize = params.imageSize || imageModel.defaultImageSize || "1K";
       const quality = params.quality || "auto";
       let prompt = params.prompt;
 
@@ -1421,16 +1909,19 @@ export default function piImageGen(pi: ExtensionAPI) {
       if (params.maskPath && !params.imagePath) {
         throw new Error("maskPath requires imagePath.");
       }
-      if (hasEditInput && imageModel.api !== "openai-images") {
+      if (hasEditInput && !supportsEdit) {
         throw new Error(
-          `Image editing currently requires an openai-images model; selected ${imageModel.provider}/${imageModel.id} uses ${imageModel.api}.`,
+          `Image editing is not enabled for ${imageModel.provider}/${imageModel.id}` +
+          (imageModel.api === "openai-images"
+            ? "; enable it with /image-model."
+            : ` (${imageModel.api} does not expose /images/edits).`),
         );
       }
       const inputPath = params.imagePath ? resolveInputImagePath(params.imagePath, ctx.cwd) : undefined;
       const inputImage = inputPath
         ? await loadInputImage(inputPath, ctx.cwd, "input image")
         : undefined;
-      if (inputImage && !params.aspectRatio) {
+      if (inputImage && !params.aspectRatio && !imageModel.defaultAspectRatio) {
         aspectRatio = closestAspectRatio(inputImage);
       }
       let maskImage = params.maskPath

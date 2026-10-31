@@ -6,16 +6,18 @@
 pi install @meatroll/pi-image-gen
 ```
 
-Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native image APIs (`generateContent` for Gemini image models, `predict` for Imagen), so any OpenAI-compatible relay works.
+Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Import an image model from the providers in Pi's own `models.json` into the plugin's config, or use a built-in model. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native image APIs (`generateContent` for Gemini image models, `predict` for Imagen), so any OpenAI-compatible relay works.
 
 ## Features
 
 - 🎨 **Built-in models** — OpenAI (GPT Image, DALL-E) and Google Gemini
+- 🗂️ **Import from Pi's `models.json`** — `/image-model` lists your configured providers' models in a `/model`-style picker
+- 🧭 **Import wizard** — choose the image API, response format, editing support and defaults; the model is written to `pi-image-gen.json[c]` as a standard provider entry
 - 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
 - 🖼️ **Aspect ratios & resolution** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` maps to Gemini's 1K/2K/4K tiers
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
-- 🎯 **`/image-model` command** — Interactive fuzzy-search model picker with session persistence
+- 🎯 **`/image-model` command** — Pi-model picker, per-model options, and session persistence
 - 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, choose the suggested prompt or write a custom one
 
 ## Install
@@ -79,19 +81,66 @@ The service only serves the source image and accepts the mask for that single ru
 
 ### Choosing a Model
 
-Use `/image-model` — works in both Pi terminal and Minapi:
+`/image-model` opens a picker styled like Pi's `/model` selector. It lists:
+
+- every model from the providers in your Pi `~/.pi/agent/models.json`,
+- the models already declared in the plugin's `providers`, and
+- the built-in catalog when no plugin providers are declared.
+
+Pi has no field for image-generation models, so any model in `models.json` can be imported. After selecting one, the extension asks how to call it:
+
+1. **Image API** — `openai-images` (`/images/generations`, `/images/edits`) or `google-generative-ai-image` (Gemini `generateContent` / Imagen `predict`)
+2. **Response format** — `url` or `b64_json` (OpenAI-compatible APIs only)
+3. **Image editing** — whether the model supports `/images/edits`
+4. **Default aspect ratio** — used when `generate_image` omits `aspectRatio`; edits still use the input image unless you set one
+5. **Default image size** — 1K/2K/4K (Gemini/Imagen only)
+
+The wizard then writes a normal `providers.<provider>.models[]` entry into the global `pi-image-gen.json[c]`, copying `baseUrl`, `apiKey` and `headers` from Pi. From that point the model is managed independently: later changes in Pi's `models.json` are not synced.
+
+Selecting a model that is already in the plugin config offers **Keep the current configuration** or **Reconfigure and re-import**.
+
+> [!NOTE]
+> Importing rewrites the global settings file, so JSONC comments and formatting are lost. `.jsonc` and `.json` both work; `.json` is read first when both exist.
 
 ```
-/image-model                                 # Interactive picker (fuzzy search)
-/image-model openai/gpt-image-1              # Direct selection
-/image-model meatroll/gemini-4-argon        # Relay model
+/image-model                                 # picker (fuzzy search)
+/image-model meatroll/gemini-4-argon         # direct import
 ```
 
 Selection persists in the session and shows in the status bar as `🎨 provider/model`.
 
+### Imported model entries
+
+An imported model is a standard settings entry, so it can be edited by hand afterwards:
+
+```json
+{
+  "providers": {
+    "meatroll": {
+      "baseUrl": "https://api.meatroll.shop/v1",
+      "apiKey": "sk-…",
+      "headers": { "User-Agent": "Mozilla/5.0 …" },
+      "api": "openai-images",
+      "models": [
+        {
+          "id": "gemini-4-argon",
+          "name": "Gemini 4 Argon",
+          "api": "openai-images",
+          "responseFormat": "url",
+          "supportsEdit": true,
+          "defaultAspectRatio": "1:1"
+        }
+      ]
+    }
+  }
+}
+```
+
+Running `/image-model` again on the same model with **Reconfigure and re-import** refreshes the copied credentials and options. Because the import writes a `providers` entry, the built-in catalog is replaced by the declared providers; list every provider you want to keep, or remove the `providers` block to return to the built-ins.
+
 ## Built-in Providers & Models
 
-Models come from the static catalog in `scripts/generate-image-models.ts`. Run `npm run generate-models` to refresh.
+The built-in models come from the static catalog in `scripts/generate-image-models.ts`; run `npm run generate-models` to refresh it. Imported models are written to the plugin config and do not depend on this catalog.
 
 | Provider | Models | API Key | API Type |
 |----------|--------|---------|----------|
@@ -102,8 +151,8 @@ Models come from the static catalog in `scripts/generate-image-models.ts`. Run `
 
 When generating an image, the model is resolved in this order:
 
-1. **Session selection** — `/image-model` command
-2. **Settings file** — `defaultProvider` / `defaultModel` in `pi-image-gen.json`
+1. **Session selection** — `/image-model` command (imported models included)
+2. **Settings file** — `defaultProvider` / `defaultModel` in `pi-image-gen.json` or `pi-image-gen.state.json`
 3. **Default** — the first OpenAI model, then anything available
 
 ## Configuration
@@ -114,11 +163,11 @@ When generating an image, the model is resolved in this order:
 
 The loader accepts JSONC: `//` line comments, `/* */` block comments and trailing commas are stripped before parsing, so the example can be pasted straight into your config. Both `pi-image-gen.json` and `pi-image-gen.jsonc` are read (`.json` first), globally and per project.
 
-Picks made through `/image-model` are written to `pi-image-gen.state.json` rather than into your config, so a commented config is never rewritten.
+Picks made through `/image-model` store the last selection in `pi-image-gen.state.json`. Importing a model also writes it into the global `pi-image-gen.json[c]`, which rewrites that file and drops JSONC comments.
 
 Two rules that surprise people:
 
-- Declaring any `providers` entry replaces the built-in model catalog. List every provider you want to keep.
+- Declaring any `providers` entry replaces the built-in model catalog. Importing adds one, so import every model you need or keep your own `providers` list complete.
 - `saveDir` is used verbatim — `~` is not expanded. Use an absolute path.
 
 ### Custom Models via Settings
@@ -133,19 +182,26 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) o
     "local-llm": {
       "baseUrl": "http://192.168.1.51:9999/v1",
       "apiKey": "MY_API_KEY",
+      "headers": { "User-Agent": "My Relay Client" },
       "api": "openai-images",
       "responseFormat": "b64_json",
       "models": [
         {
           "id": "my-local-image-model",
           "name": "My Local Image Model",
-          "cost": 0
+          "cost": 0,
+          "responseFormat": "url",
+          "supportsEdit": true,
+          "defaultAspectRatio": "16:9",
+          "defaultImageSize": "1K"
         }
       ]
     }
   }
 }
 ```
+
+Model entries accept `responseFormat`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize` — the fields the import wizard writes. `api` can be set per model to override the provider.
 
 For providers whose signed image URLs require server-side authentication, set `responseFormat` to `b64_json`. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request to the provider.
 
@@ -157,9 +213,9 @@ For providers whose signed image URLs require server-side authentication, set `r
 
 Model-level `api` overrides provider-level `api`.
 
-### Legacy: `models.json`
+### Legacy: tagged `models.json` entries
 
-`pi-image-gen` also reads `providers.<name>.models[]` entries in `~/.pi/agent/models.json` that are tagged with `output: ["image"]`. This is lower priority than the settings file.
+`pi-image-gen` still reads `providers.<name>.models[]` entries in `~/.pi/agent/models.json` that are tagged with `output: ["image"]` and model overrides tagged the same way. This is lower priority than the settings file and is only used when no plugin `providers` are declared. Pi ignores the tag, so prefer `/image-model`, which imports the model into the plugin config.
 
 ## Save Modes
 
@@ -183,8 +239,8 @@ The `generate_image` tool accepts:
 | `prompt` | string | *required* | Description of the image to generate or edit. After a region is selected, this is offered as the suggested prompt; choose it or write a custom prompt |
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
-| `aspectRatio` | string | `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
-| `imageSize` | string | `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; the OpenAI Images API has no equivalent and ignores it |
+| `aspectRatio` | string | configured default, else `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
+| `imageSize` | string | configured default, else `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; the OpenAI Images API has no equivalent and ignores it |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |
@@ -192,10 +248,11 @@ The `generate_image` tool accepts:
 
 ## Pi Integration
 
-- **API keys** — Resolved via `ctx.modelRegistry.getApiKeyForProvider()` (env vars, auth.json, OAuth)
-- **Base URLs** — From model data, settings providers, or Pi's registry
-- **Custom providers** — Define in `~/.pi/agent/settings/pi-image-gen.json`
-- **Image edits** — Use `imagePath` and optional `maskPath` with a provider configured as `openai-images`; omitting `maskPath` in the TUI first asks whether to select a region
+- **API keys & headers** — Values declared in the plugin `providers` win (imported models copy them from Pi); Pi's registry fills the rest via `ctx.modelRegistry.getApiKeyAndHeaders()` (env vars, auth.json, OAuth, `models.json`)
+- **Base URLs** — From the plugin `providers`, then Pi's `models.json` (provider or model level), then Pi's registry
+- **Model list** — Pi `models.json` providers (for import) plus the plugin config catalog
+- **Custom providers** — Define in `~/.pi/agent/settings/pi-image-gen.json` or import a `models.json` model with `/image-model`
+- **Image edits** — Use `imagePath` and optional `maskPath` with an `openai-images` model that has editing enabled; omitting `maskPath` in the TUI first asks whether to select a region
 - **Mask selection** — The browser selector can create a mask inside Pi's interactive edit flow
 
 ## Architecture
@@ -205,22 +262,22 @@ Mirrors Pi's text model pipeline:
 | Layer | Pi (text) | pi-image-gen |
 |-------|-----------|--------------|
 | Build-time discovery | `generate-models.ts` → `models.generated.ts` | `generate-image-models.ts` → `image-models.generated.ts` |
-| Sources | models.dev, OpenRouter, AI Gateway | Static catalog in `generate-image-models.ts` |
-| Custom models | `models.json` providers | `settings/pi-image-gen.json` (preferred) + legacy `models.json` |
-| API key resolution | `ModelRegistry.getApiKeyForProvider()` | Same |
-| Model selection | Ctrl+P / model selector | `/image-model` command |
+| Sources | models.dev, OpenRouter, AI Gateway | Static catalog + models imported from Pi `models.json` |
+| Custom models | `models.json` providers | Imported Pi models and hand-written entries in `settings/pi-image-gen.json` + legacy tags |
+| API key & header resolution | `ModelRegistry.getApiKeyAndHeaders()` | Plugin `providers` first, then `ModelRegistry.getApiKeyAndHeaders()` |
+| Model selection | Ctrl+P / model selector | `/image-model` (same picker layout) |
 
 ### Model Priority (lowest → highest)
 
 1. **Built-in generated** — `image-models.generated.ts` (baked into package)
-2. **Legacy `models.json`** — `providers.<name>.models[]` entries with `output: ["image"]`
-3. **Settings providers** — `providers` in `pi-image-gen.json` settings file
+2. **Legacy `models.json` tags** — `providers.<name>.models[]` entries with `output: ["image"]`
+3. **Settings providers** — `providers` in `pi-image-gen.json`, including models imported by `/image-model`
 4. **Session selection** — `/image-model` command or tool params
 
 ## Adding Providers
 
-1. Add static models to `scripts/generate-image-models.ts`
-2. Run `npm run generate-models`
+1. Import a model from `~/.pi/agent/models.json` with `/image-model`, or add a `providers` entry to `~/.pi/agent/settings/pi-image-gen.json`,
+2. or add static models to `scripts/generate-image-models.ts` and run `npm run generate-models`
 3. Add generation logic in `extensions/image-gen.ts` if a new API type is needed
 
 ## License
