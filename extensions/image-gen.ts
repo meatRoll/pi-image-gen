@@ -1776,12 +1776,15 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
         Math.min(selectedIndex - Math.floor(maxVisible / 2), spec.options.length - maxVisible),
       );
       const endIndex = Math.min(startIndex + maxVisible, spec.options.length);
+      const hasCurrent = spec.current !== undefined;
       for (let i = startIndex; i < endIndex; i++) {
         const option = spec.options[i];
         if (!option) continue;
         const highlighted = i === selectedIndex;
         const cursor = highlighted ? theme.fg("accent", "→ ") : "  ";
-        const current = Object.is(option.value, spec.current) ? theme.fg("accent", "✓ ") : "  ";
+        const current = hasCurrent
+          ? Object.is(option.value, spec.current) ? theme.fg("accent", "✓ ") : "  "
+          : "";
         list.addChild(new Text(`${cursor}${current}${highlighted ? theme.fg("accent", option.label) : option.label}`, 0, 0));
       }
       if (startIndex > 0 || endIndex < spec.options.length) {
