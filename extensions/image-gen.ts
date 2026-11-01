@@ -37,6 +37,7 @@ import {
   Text,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
+import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 const execFileAsync = promisify(execFile);
@@ -1737,8 +1738,8 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
         theme.fg(
           "muted",
           streaming
-            ? `Streaming… · Esc stop · PgUp/PgDn scroll${scrollHint}`
-            : `Enter send · PgUp/PgDn scroll${scrollHint} · Esc close`,
+            ? `Streaming… · Esc stop · Wheel/PgUp/PgDn scroll${scrollHint}`
+            : `Enter send · Wheel/PgUp/PgDn scroll${scrollHint} · Esc close`,
         ),
       );
     }
@@ -1844,6 +1845,19 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       },
       invalidate(): void {
         container.invalidate();
+      },
+      handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+        if (event.type !== "wheel") return undefined;
+        const delta = event.wheelDelta ?? 0;
+        if (delta < 0) {
+          scrollFromBottom = Math.min(maxScroll, scrollFromBottom - delta);
+        } else if (delta > 0) {
+          scrollFromBottom = Math.max(0, scrollFromBottom - delta);
+        }
+        tui.requestRender();
+        // Consume the wheel event so the chat transcript scrolls instead of
+        // the main screen behind the popup.
+        return { handled: true, render: true };
       },
       handleInput(data: string): void {
         if (matchesKey(data, "escape")) {

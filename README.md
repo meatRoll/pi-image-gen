@@ -124,7 +124,7 @@ Provider fields affect every model in that provider. Changing a model ID checks 
 
 #### AI help
 
-Press `Ctrl+G` on any text or select field to open a streaming chat popup for that field. The form stays visible underneath. Type a question and press `Enter`; the answer streams into the popup and you can keep asking follow-ups. Nothing is applied automatically: copy any value you want into the field yourself. `Esc` stops an in-flight answer, and `Esc` again closes the popup. AI never receives `apiKey` or secret header values. If the current model has no configured auth, AI help is unavailable and the field stays in manual mode.
+Press `Ctrl+G` on any text or select field to open a streaming chat popup for that field. The form stays visible underneath. Type a question and press `Enter`; the answer streams into the popup and you can keep asking follow-ups. Nothing is applied automatically: copy any value you want into the field yourself. Use the mouse wheel or `PgUp`/`PgDn` to scroll the transcript; the popup consumes those events instead of scrolling the main screen. `Esc` stops an in-flight answer, and `Esc` again closes the popup. AI never receives `apiKey` or secret header values. If the current model has no configured auth, AI help is unavailable and the field stays in manual mode.
 
 #### JSON mode
 
