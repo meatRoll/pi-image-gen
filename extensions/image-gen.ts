@@ -36,6 +36,7 @@ import {
   Spacer,
   Text,
 } from "@earendil-works/pi-tui";
+import type { OverlayOptions } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 const execFileAsync = promisify(execFile);
@@ -1754,9 +1755,18 @@ interface SelectUISpec<T> {
   /** Initial focus when the menu is an action list with no current value. */
   initial?: T;
   allowAi?: boolean;
+  /** Render this menu as a floating overlay instead of replacing the editor. */
+  overlay?: boolean;
+  overlayOptions?: OverlayOptions;
 }
 
 type SelectUIResult<T> = { kind: "value"; value: T } | { kind: "ai" };
+
+const AI_POPUP_OPTIONS: OverlayOptions = {
+  width: "80%",
+  maxHeight: "85%",
+  margin: 1,
+};
 
 async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promise<SelectUIResult<T> | undefined> {
   if (!ctx.hasUI) return undefined;
@@ -1836,7 +1846,9 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
         tui.requestRender();
       },
     };
-  });
+  }, spec.overlay
+    ? { overlay: true, overlayOptions: spec.overlayOptions ?? AI_POPUP_OPTIONS }
+    : undefined);
 }
 
 /** Ask a select field. Ctrl+G asks the current model for a suggestion. */
@@ -1868,6 +1880,7 @@ async function askChoiceField<T>(
       }
       const gate = await selectUI<string>(ctx, {
         title: `${spec.title} — AI suggestion`,
+        overlay: true,
         note: [
           `Use: ${option.label}`,
           suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,
@@ -1929,6 +1942,7 @@ async function askTextField(ctx: ExtensionContext, spec: TextUISpec): Promise<st
       const suggested = formatAiValue(suggestion.value);
       const gate = await selectUI<string>(ctx, {
         title: `${spec.title} — AI suggestion`,
+        overlay: true,
         note: [
           `Use: ${suggested}`,
           suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,
@@ -2037,6 +2051,7 @@ async function askHeaders(
       }
       const gate = await selectUI<string>(ctx, {
         title: "Request headers — AI suggestion",
+        overlay: true,
         note: [
           `Use: ${formatAiValue(suggestion.value)}`,
           suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,

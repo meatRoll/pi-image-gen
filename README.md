@@ -124,7 +124,7 @@ Provider fields affect every model in that provider. Changing a model ID checks 
 
 #### AI help
 
-Press `Ctrl+G` on any text or select field to ask the current chat model for a field-level suggestion. The suggestion includes a reason and confidence; apply it, ask again, or enter a value manually. AI never runs automatically, never touches `apiKey`, and never receives credentials. If the current model has no configured auth, the field falls back to manual entry.
+Press `Ctrl+G` on any text or select field to ask the current chat model for a field-level suggestion. The suggestion opens as a floating popup over the field, so the form stays visible underneath. It includes a reason and confidence; apply it, ask again, or enter a value manually. AI never runs automatically, never touches `apiKey`, and never receives credentials. If the current model has no configured auth, the field falls back to manual entry.
 
 #### JSON mode
 
