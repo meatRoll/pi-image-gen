@@ -85,7 +85,7 @@ The service only serves the source image and accepts the mask for that single ru
 
 There is no built-in catalog: `/image-model` lists exactly the models declared under `providers` in the plugin settings. If the list is empty, press `a` to add the first model.
 
-The picker has two focus areas, and the footer changes with the focused one:
+The picker has two focus areas, and the footer changes with the focused one. The active area is marked with `▸`, and the footer starts with `SEARCH` or `LIST`. The input cursor block only appears while search is focused; the `→` row marker only appears while the list is focused.
 
 - **Search** (top) — type to filter; `Tab` or `↓` moves focus to the list.
 - **List** (bottom) — `↑↓` move, `Enter` select, `a` add, `e` edit, `d` delete, `j` JSON mode, `Tab` or `↑` back to search.

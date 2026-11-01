@@ -1310,6 +1310,19 @@ function piPickItems(ctx: ExtensionContext, config: ExtensionConfig): ImageModel
 /** /model-style picker. Search sits above the list and owns one focus slot;
  *  the list owns the other. Actions only fire while the list is focused, so
  *  typing in the search field never triggers add/edit/delete. */
+/**
+ * Input always renders a reverse-video fake cursor, even while `focused` is
+ * false. Strip that marker when unfocused so the cursor block itself is a
+ * reliable focus indicator: block in the search box means search has focus.
+ */
+class FocusAwareInput extends Input {
+  override render(width: number): string[] {
+    const lines = super.render(width);
+    if (this.focused) return lines;
+    return lines.map((line) => line.replace(/\x1b_pi:fc\x07(.*?)\x1b_pi:\/fc\x07/g, "$1"));
+  }
+}
+
 async function pickImageModel(
   ctx: ExtensionContext,
   items: ImageModelPickItem[],
@@ -1318,7 +1331,7 @@ async function pickImageModel(
   if (!ctx.hasUI) return undefined;
   const { currentKey, defaultKey, actions, hint, showConfigBadge = false } = options;
   return ctx.ui.custom<ImageModelPickerResult | undefined>((tui, theme, kb, done) => {
-    const searchInput = new Input({ prompt: "", placeholder: "type to filter" });
+    const searchInput = new FocusAwareInput({ prompt: "", placeholder: "type to filter" });
     const searchLabel = new Text("", 0, 0);
     const listLabel = new Text("", 0, 0);
     const listContainer = new Container();
@@ -1368,11 +1381,7 @@ async function pickImageModel(
         const isCurrent = item.key === currentKey;
         const isDefault = item.key === defaultKey;
         const listFocused = focus === "list";
-        const cursor = isHighlighted
-          ? listFocused
-            ? theme.fg("accent", "→ ")
-            : theme.fg("dim", "· ")
-          : "  ";
+        const cursor = isHighlighted && listFocused ? theme.fg("accent", "→ ") : "  ";
         const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
         const idText = isHighlighted && listFocused ? theme.fg("accent", item.id) : item.id;
         const name = modelNameSuffix(item.id, item.name, item.provider);
