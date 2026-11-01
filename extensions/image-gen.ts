@@ -1249,15 +1249,17 @@ interface ImageModelPickerOptions {
 const ASPECT_RATIO_OPTIONS = ["1:1", "16:9", "9:16", "3:2", "2:3", "4:3", "3:4", "4:5", "5:4", "21:9"] as const;
 
 /** Show the model name only when it adds words the ID does not. */
-function modelNameSuffix(id: string, name?: string): string | undefined {
+function modelNameSuffix(id: string, name?: string, provider?: string): string | undefined {
   const trimmed = name?.trim();
   if (!trimmed) return undefined;
   const words = (value: string) => value.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean);
   const idWords = words(id);
   const idSet = new Set(idWords);
   const compactId = idWords.join("");
+  const providerWords = new Set(words(provider ?? ""));
   const covered = (word: string) => idSet.has(word) || (word.length > 1 && compactId.includes(word));
-  return words(trimmed).every(covered) ? undefined : trimmed;
+  const extra = words(trimmed).filter((word) => !covered(word) && !providerWords.has(word));
+  return extra.length > 0 ? extra.join(" ") : undefined;
 }
 
 function imageModelDetail(model: ResolvedImageModel): string {
@@ -1318,6 +1320,7 @@ async function pickImageModel(
   return ctx.ui.custom<ImageModelPickerResult | undefined>((tui, theme, kb, done) => {
     const searchInput = new Input({ prompt: "", placeholder: "type to filter" });
     const searchLabel = new Text("", 0, 0);
+    const listLabel = new Text("", 0, 0);
     const listContainer = new Container();
     const footer = new Text("", 0, 0);
     let focus: "search" | "list" = items.length === 0 && actions ? "list" : "search";
@@ -1326,20 +1329,24 @@ async function pickImageModel(
 
     function footerText(): string {
       if (focus === "search") {
-        return "type to filter · Tab/↓ list · Enter select · Esc clear/close";
+        return "SEARCH · type to filter · Tab/↓ list · Enter select · Esc clear/close";
       }
       return actions
-        ? "↑↓ move · Enter select · a add · e edit · d delete · j JSON · Tab/↑ search · Esc close"
-        : "↑↓ move · Enter select · Tab/↑ search · Esc close";
+        ? "LIST · ↑↓ move · Enter select · a add · e edit · d delete · j JSON · Tab/↑ search · Esc close"
+        : "LIST · ↑↓ move · Enter select · Tab/↑ search · Esc close";
     }
 
     function updateFocus(): void {
       searchInput.focused = focus === "search";
       searchLabel.setText(
-        theme.fg(
-          focus === "search" ? "accent" : "muted",
-          focus === "search" ? "Search (typing filters)" : "Search",
-        ),
+        focus === "search"
+          ? theme.fg("accent", "▸ Search — typing filters")
+          : theme.fg("muted", "  Search — Tab/↓ to edit"),
+      );
+      listLabel.setText(
+        focus === "list"
+          ? theme.fg("accent", `▸ Models — Enter select${actions ? " · a add · e edit · d delete · j JSON" : ""}`)
+          : theme.fg("muted", "  Models — Tab/↑ to focus"),
       );
       footer.setText(theme.fg("muted", footerText()));
       updateList();
@@ -1360,20 +1367,22 @@ async function pickImageModel(
         const isHighlighted = i === selectedIndex;
         const isCurrent = item.key === currentKey;
         const isDefault = item.key === defaultKey;
-        const cursor = isHighlighted ? theme.fg("accent", "→ ") : "  ";
+        const listFocused = focus === "list";
+        const cursor = isHighlighted
+          ? listFocused
+            ? theme.fg("accent", "→ ")
+            : theme.fg("dim", "· ")
+          : "  ";
         const currentMarker = isCurrent ? theme.fg("accent", "✓ ") : "  ";
-        const idText = isHighlighted ? theme.fg("accent", item.id) : item.id;
-        const name = modelNameSuffix(item.id, item.name);
+        const idText = isHighlighted && listFocused ? theme.fg("accent", item.id) : item.id;
+        const name = modelNameSuffix(item.id, item.name, item.provider);
         const nameText = name ? theme.fg("muted", ` (${name})`) : "";
         const providerBadge = theme.fg("muted", ` [${item.provider}]`);
         const configuredBadge = showConfigBadge && item.inConfig ? theme.fg("success", " · in config") : "";
         const defaultBadge = isDefault ? theme.fg("muted", " · default") : "";
+        const line = `${cursor}${currentMarker}${idText}${nameText} ${providerBadge}${configuredBadge}${defaultBadge}`;
         listContainer.addChild(
-          new Text(
-            `${cursor}${currentMarker}${idText}${nameText} ${providerBadge}${configuredBadge}${defaultBadge}`,
-            0,
-            0,
-          ),
+          new Text(listFocused && isHighlighted ? theme.bg("selectedBg", line) : line, 0, 0),
         );
       }
 
@@ -1435,6 +1444,7 @@ async function pickImageModel(
     container.addChild(searchLabel);
     container.addChild(searchInput);
     container.addChild(new Spacer(1));
+    container.addChild(listLabel);
     container.addChild(listContainer);
     container.addChild(new Spacer(1));
     container.addChild(footer);
