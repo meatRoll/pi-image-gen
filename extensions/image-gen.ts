@@ -28,6 +28,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
 import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import {
+  Box,
   Container,
   fuzzyFilter,
   getImageDimensions,
@@ -35,6 +36,7 @@ import {
   matchesKey,
   Spacer,
   Text,
+  visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
 import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
@@ -1688,16 +1690,17 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
     const transcriptView = new Text("", 0, 0);
     const footer = new Text("", 0, 0);
 
-    const container = new Container();
-    container.addChild(new DynamicBorder());
-    container.addChild(header);
-    container.addChild(contextLine);
-    container.addChild(new Spacer(1));
-    container.addChild(transcriptView);
-    container.addChild(new Spacer(1));
-    container.addChild(input);
-    container.addChild(footer);
-    container.addChild(new DynamicBorder());
+    const bodyContainer = new Container();
+    bodyContainer.addChild(header);
+    bodyContainer.addChild(contextLine);
+    bodyContainer.addChild(new Spacer(1));
+    bodyContainer.addChild(transcriptView);
+    bodyContainer.addChild(new Spacer(1));
+    bodyContainer.addChild(input);
+    bodyContainer.addChild(footer);
+    // Inset the content by one column so text does not touch the side borders.
+    const body = new Box(1, 0);
+    body.addChild(bodyContainer);
 
     const chat: AiChatEntry[] = [];
     const history: Message[] = [];
@@ -1831,8 +1834,10 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
 
     return {
       render(width: number): string[] {
-        const innerWidth = Math.max(20, width - 2);
-        const lines = buildTranscript(innerWidth);
+        const frameWidth = Math.max(4, width);
+        const bodyWidth = Math.max(1, frameWidth - 2);
+        const contentWidth = Math.max(1, bodyWidth - 2);
+        const lines = buildTranscript(contentWidth);
         visibleTranscriptHeight = Math.min(maxTranscriptHeight, Math.max(3, lines.length));
         maxScroll = Math.max(0, lines.length - visibleTranscriptHeight);
         if (scrollFromBottom > maxScroll) scrollFromBottom = maxScroll;
@@ -1841,10 +1846,21 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
         while (visible.length < visibleTranscriptHeight) visible.push("");
         transcriptView.setText(visible.join("\n"));
         updateFooter();
-        return container.render(width);
+        const bodyLines = body.render(bodyWidth);
+        const borderColor = (value: string) => theme.fg("border", value);
+        const side = borderColor("│");
+        const framed = bodyLines.map((line) => {
+          const padding = " ".repeat(Math.max(0, bodyWidth - visibleWidth(line)));
+          return side + line + padding + side;
+        });
+        return [
+          borderColor(`╭${"─".repeat(bodyWidth)}╮`),
+          ...framed,
+          borderColor(`╰${"─".repeat(bodyWidth)}╯`),
+        ];
       },
       invalidate(): void {
-        container.invalidate();
+        body.invalidate();
       },
       handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
         if (event.type !== "wheel") return undefined;
