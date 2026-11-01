@@ -39,7 +39,7 @@ import {
   visibleWidth,
   wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
+import type { OverlayHandle, TuiMouseEvent, TuiMouseEventResult } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 const execFileAsync = promisify(execFile);
@@ -1670,6 +1670,7 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
   const chatModel = model;
 
   const systemPrompt = aiChatSystemPrompt(spec);
+  let chatOverlayHandle: OverlayHandle | undefined;
   await ctx.ui.custom<void>((tui, theme, kb, done) => {
     const input = new FocusAwareInput({
       prompt: theme.fg("accent", "› "),
@@ -1707,6 +1708,7 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
     let streaming = false;
     let controller: AbortController | undefined;
     let copyMode = false;
+    let copyHandle: OverlayHandle | undefined;
     let scrollFromBottom = 0;
     let copyScrollFromBottom = 0;
     let maxScroll = 0;
@@ -1751,8 +1753,8 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       return lines;
     }
 
-    function copyViewportHeight(): number {
-      return Math.max(3, Math.min(tui.terminal.rows - 2, Math.floor(tui.terminal.rows * 0.85) - 2));
+    function copyFullscreenHeight(): number {
+      return Math.max(1, tui.terminal.rows);
     }
 
     function updateFooter(): void {
@@ -1848,20 +1850,80 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       }
     }
 
+    function openCopyView(): void {
+      if (copyMode) return;
+      copyMode = true;
+      copyScrollFromBottom = 0;
+      input.focused = false;
+      chatOverlayHandle?.setHidden(true);
+      const copyView = {
+        render(width: number): string[] {
+          const lines = buildCopyView(Math.max(1, width));
+          const viewport = copyFullscreenHeight();
+          maxCopyScroll = Math.max(0, lines.length - viewport);
+          if (copyScrollFromBottom > maxCopyScroll) copyScrollFromBottom = maxCopyScroll;
+          const start = Math.max(0, lines.length - viewport - copyScrollFromBottom);
+          const visible = lines.slice(start, start + viewport);
+          while (visible.length < viewport) visible.push("");
+          return visible;
+        },
+        invalidate(): void {},
+        handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
+          if (event.type !== "wheel") return undefined;
+          const delta = event.wheelDelta ?? 0;
+          if (delta < 0) {
+            copyScrollFromBottom = Math.min(maxCopyScroll, copyScrollFromBottom - delta);
+          } else if (delta > 0) {
+            copyScrollFromBottom = Math.max(0, copyScrollFromBottom - delta);
+          }
+          tui.requestRender();
+          return { handled: true, render: true };
+        },
+        handleInput(data: string): void {
+          if (matchesKey(data, "escape") || matchesKey(data, "ctrl+o")) {
+            closeCopyView();
+            return;
+          }
+          if (kb.matches(data, "tui.select.pageUp")) {
+            copyScrollFromBottom = Math.min(
+              maxCopyScroll,
+              copyScrollFromBottom + Math.max(1, Math.floor(copyFullscreenHeight() / 2)),
+            );
+          } else if (kb.matches(data, "tui.select.pageDown")) {
+            copyScrollFromBottom = Math.max(
+              0,
+              copyScrollFromBottom - Math.max(1, Math.floor(copyFullscreenHeight() / 2)),
+            );
+          }
+          tui.requestRender();
+        },
+      };
+      copyHandle = tui.showOverlay(copyView, {
+        anchor: "top-left",
+        width: "100%",
+        maxHeight: "100%",
+        margin: 0,
+      });
+      tui.requestRender();
+    }
+
+    function closeCopyView(): void {
+      if (!copyMode) return;
+      copyMode = false;
+      copyHandle?.hide();
+      copyHandle = undefined;
+      chatOverlayHandle?.setHidden(false);
+      chatOverlayHandle?.focus();
+      input.focused = !streaming;
+      tui.requestRender();
+    }
+
     input.onSubmit = () => {
       void send();
     };
 
     return {
       render(width: number): string[] {
-        if (copyMode) {
-          const lines = buildCopyView(Math.max(1, width));
-          const viewport = copyViewportHeight();
-          maxCopyScroll = Math.max(0, lines.length - viewport);
-          if (copyScrollFromBottom > maxCopyScroll) copyScrollFromBottom = maxCopyScroll;
-          const start = Math.max(0, lines.length - viewport - copyScrollFromBottom);
-          return lines.slice(start, start + viewport);
-        }
         const frameWidth = Math.max(4, width);
         const bodyWidth = Math.max(1, frameWidth - 2);
         const contentWidth = Math.max(1, bodyWidth - 2);
@@ -1893,13 +1955,7 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
         if (event.type !== "wheel") return undefined;
         const delta = event.wheelDelta ?? 0;
-        if (copyMode) {
-          if (delta < 0) {
-            copyScrollFromBottom = Math.min(maxCopyScroll, copyScrollFromBottom - delta);
-          } else if (delta > 0) {
-            copyScrollFromBottom = Math.max(0, copyScrollFromBottom - delta);
-          }
-        } else if (delta < 0) {
+        if (delta < 0) {
           scrollFromBottom = Math.min(maxScroll, scrollFromBottom - delta);
         } else if (delta > 0) {
           scrollFromBottom = Math.max(0, scrollFromBottom - delta);
@@ -1911,28 +1967,7 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       },
       handleInput(data: string): void {
         if (matchesKey(data, "ctrl+o")) {
-          copyMode = !copyMode;
-          if (copyMode) copyScrollFromBottom = 0;
-          input.focused = !copyMode && !streaming;
-          tui.requestRender();
-          return;
-        }
-        if (copyMode) {
-          if (matchesKey(data, "escape")) {
-            copyMode = false;
-            input.focused = !streaming;
-          } else if (kb.matches(data, "tui.select.pageUp")) {
-            copyScrollFromBottom = Math.min(
-              maxCopyScroll,
-              copyScrollFromBottom + Math.max(1, Math.floor(copyViewportHeight() / 2)),
-            );
-          } else if (kb.matches(data, "tui.select.pageDown")) {
-            copyScrollFromBottom = Math.max(
-              0,
-              copyScrollFromBottom - Math.max(1, Math.floor(copyViewportHeight() / 2)),
-            );
-          }
-          tui.requestRender();
+          openCopyView();
           return;
         }
         if (matchesKey(data, "escape")) {
@@ -1961,6 +1996,9 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
   }, {
     overlay: true,
     overlayOptions: { width: "85%", maxHeight: "85%", margin: 1 },
+    onHandle: (handle) => {
+      chatOverlayHandle = handle;
+    },
   });
 }
 
