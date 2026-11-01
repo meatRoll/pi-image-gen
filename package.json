@@ -11,15 +11,11 @@
   "files": [
     "extensions/",
     "lib/",
-    "scripts/",
     "settings.example.jsonc",
     "README.md",
     "LICENSE",
     "screenshot.png"
   ],
-  "scripts": {
-    "generate-models": "npx tsx scripts/generate-image-models.ts"
-  },
   "pi": {
     "extensions": [
       "./extensions"

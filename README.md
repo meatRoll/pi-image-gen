@@ -6,18 +6,20 @@
 pi install @meatroll/pi-image-gen
 ```
 
-Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model`. Import an image model from the providers in Pi's own `models.json` into the plugin's config, or use a built-in model. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native image APIs (`generateContent` for Gemini image models, `predict` for Imagen), so any OpenAI-compatible relay works.
+Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a `generate_image` tool, an interactive browser edit-region selector, and `/image-model` for adding, editing and deleting image models. Models can be entered manually or imported from the providers in Pi's own `models.json`. Supports the OpenAI Images API (`/images/generations` and `/images/edits`) plus Google's native image APIs (`generateContent` for Gemini image models, `predict` for Imagen), so any OpenAI-compatible relay works.
 
 ## Features
 
-- 🎨 **Built-in models** — OpenAI (GPT Image, DALL-E) and Google Gemini
-- 🗂️ **Import from Pi's `models.json`** — `/image-model` lists your configured providers' models in a `/model`-style picker
-- 🧭 **Import wizard** — choose the image API, response format, editing support and defaults; the model is written to `pi-image-gen.json[c]` as a standard provider entry
+- 🎨 **Model management** — add, edit and delete models from `/image-model`; every model lives in the plugin settings
+- 🗂️ **Import from Pi's `models.json`** — list the models exposed by providers in Pi's config and copy the selected one into the plugin
+- 🧭 **Add/edit wizard** — choose the image API, response format, editing support, defaults, base URL, key and multi-line headers
+- ✨ **AI field help** — press `Ctrl+G` on any field to ask the current chat model for a suggestion
+- 🧾 **JSON mode** — press `j` to edit the whole global settings file in a multi-line editor
 - 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
 - 🖼️ **Aspect ratios & resolution** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` maps to Gemini's 1K/2K/4K tiers
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
-- 🎯 **`/image-model` command** — Pi-model picker, per-model options, and session persistence
+- 🎯 **`/image-model` command** — search/list focus, keyboard shortcuts, per-model options, and session persistence
 - 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, choose the suggested prompt or write a custom one
 
 ## Install
@@ -79,39 +81,68 @@ The local HTTP service starts only when the browser selector is actually launche
 
 The service only serves the source image and accepts the mask for that single run. It is never a persistent daemon.
 
-### Choosing a Model
+### Choosing and Managing Models
 
-`/image-model` opens a picker styled like Pi's `/model` selector. It lists:
+There is no built-in catalog: `/image-model` lists exactly the models declared under `providers` in the plugin settings. If the list is empty, press `a` to add the first model.
 
-- every model from the providers in your Pi `~/.pi/agent/models.json`,
-- the models already declared in the plugin's `providers`, and
-- the built-in catalog when no plugin providers are declared.
+The picker has two focus areas, and the footer changes with the focused one:
 
-Pi has no field for image-generation models, so any model in `models.json` can be imported. After selecting one, the extension asks how to call it:
+- **Search** (top) — type to filter; `Tab` or `↓` moves focus to the list.
+- **List** (bottom) — `↑↓` move, `Enter` select, `a` add, `e` edit, `d` delete, `j` JSON mode, `Tab` or `↑` back to search.
+
+#### Add
+
+`a` offers two paths:
+
+- **Custom model…** — choose an existing provider or create one, enter the model ID and display name, pick the API/options, then supply `baseUrl`, `apiKey` and multi-line JSON `headers` when needed.
+- **From Pi's models.json…** — lists every model exposed by providers in Pi's own config and imports the selected one. Pi has no image-model type, so chat models appear too; filter by name.
+
+The add wizard asks:
 
 1. **Image API** — `openai-images` (`/images/generations`, `/images/edits`) or `google-generative-ai-image` (Gemini `generateContent` / Imagen `predict`)
 2. **Response format** — `url` or `b64_json` (OpenAI-compatible APIs only)
 3. **Image editing** — whether the model supports `/images/edits`
-4. **Default aspect ratio** — used when `generate_image` omits `aspectRatio`; edits still use the input image unless you set one
+4. **Default aspect ratio** — used when `generate_image` omits `aspectRatio`
 5. **Default image size** — 1K/2K/4K (Gemini/Imagen only)
 
-The wizard then writes a normal `providers.<provider>.models[]` entry into the global `pi-image-gen.json[c]`, copying `baseUrl`, `apiKey` and `headers` from Pi. From that point the model is managed independently: later changes in Pi's `models.json` are not synced.
+Importing writes a normal `providers.<provider>.models[]` entry into the global `pi-image-gen.json[c]`, copying `baseUrl`, `apiKey` and `headers` from Pi. From that point the model is managed independently: later changes in Pi's `models.json` are not synced.
 
-Selecting a model that is already in the plugin config offers **Keep the current configuration** or **Reconfigure and re-import**.
+Selecting a model that is already imported in the import flow offers **Keep the current configuration** or **Reconfigure and re-import**.
+
+#### Edit
+
+`e` opens a field menu for the highlighted model:
+
+- model `name`, `id`, `api`, `responseFormat`, `supportsEdit`, `defaultAspectRatio`, `defaultImageSize`
+- provider `baseUrl`, default `api`, `apiKey`, `headers`
+
+Provider fields affect every model in that provider. Changing a model ID checks for conflicts.
+
+#### Delete
+
+`d` asks for confirmation and removes the model. If it was the provider's last model, the provider is removed too. If the model was the session or saved default, that selection is cleared.
+
+#### AI help
+
+Press `Ctrl+G` on any text or select field to ask the current chat model for a field-level suggestion. The suggestion includes a reason and confidence; apply it, ask again, or enter a value manually. AI never runs automatically, never touches `apiKey`, and never receives credentials. If the current model has no configured auth, the field falls back to manual entry.
+
+#### JSON mode
+
+Press `j` to edit the global settings file in a multi-line JSON editor. The extension validates the provider/model structure before writing and offers to re-edit when the JSON is invalid. Comments are lost because the file is rewritten as JSON.
+
+```
+/image-model                      # picker
+/image-model meatroll/gpt-image-2 # select a configured model, or import it from Pi's models.json
+```
+
+Selection persists in the session and `pi-image-gen.state.json`; the status bar shows `🎨 provider/model`.
 
 > [!NOTE]
-> Importing rewrites the global settings file, so JSONC comments and formatting are lost. `.jsonc` and `.json` both work; `.json` is read first when both exist.
+> Adding, editing and deleting rewrites the global `pi-image-gen.json[c]`, so JSONC comments and formatting are lost. `.jsonc` and `.json` both work; `.json` is read first when both exist.
 
-```
-/image-model                                 # picker (fuzzy search)
-/image-model meatroll/gemini-4-argon         # direct import
-```
+### Model entries
 
-Selection persists in the session and shows in the status bar as `🎨 provider/model`.
-
-### Imported model entries
-
-An imported model is a standard settings entry, so it can be edited by hand afterwards:
+Every model is a standard settings entry and can be edited by hand or through JSON mode:
 
 ```json
 {
@@ -136,38 +167,31 @@ An imported model is a standard settings entry, so it can be edited by hand afte
 }
 ```
 
-Running `/image-model` again on the same model with **Reconfigure and re-import** refreshes the copied credentials and options. Because the import writes a `providers` entry, the built-in catalog is replaced by the declared providers; list every provider you want to keep, or remove the `providers` block to return to the built-ins.
+### No built-in models
 
-## Built-in Providers & Models
-
-The built-in models come from the static catalog in `scripts/generate-image-models.ts`; run `npm run generate-models` to refresh it. Imported models are written to the plugin config and do not depend on this catalog.
-
-| Provider | Models | API Key | API Type |
-|----------|--------|---------|----------|
-| **openai** | `gpt-image-1`, `dall-e-3`, `dall-e-2` | `OPENAI_API_KEY` | `/v1/images/generations` and `/v1/images/edits` |
-| **google** | `gemini-2.0-flash-preview-image-generation`, `imagen-3.0-generate-002` | `GEMINI_API_KEY` | `:generateContent` (Gemini image models) and `:predict` (Imagen) |
+Earlier versions shipped a generated OpenAI/Google catalog. That catalog has been removed: `providers` is now the complete model list. The OpenAI and Google examples below are ordinary provider definitions you can add with `/image-model`.
 
 ## Resolution Order
 
 When generating an image, the model is resolved in this order:
 
-1. **Session selection** — `/image-model` command (imported models included)
-2. **Settings file** — `defaultProvider` / `defaultModel` in `pi-image-gen.json` or `pi-image-gen.state.json`
-3. **Default** — the first OpenAI model, then anything available
+1. **Session selection** — the last `/image-model` choice (or configured `defaultProvider`/`defaultModel`)
+2. **Settings default** — `defaultProvider` / `defaultModel` from the global, state or project file
+3. **First configured model**
 
 ## Configuration
 
 ### Full reference
 
-[`settings.example.jsonc`](settings.example.jsonc) contains every supported field with inline comments — save modes, timeouts, proxy, and four provider shapes (OpenAI-compatible relay, OpenAI direct, Gemini/Imagen, local server). A copy lives at `~/.pi/agent/settings/pi-image-gen.example.jsonc` for reference while editing.
+[`settings.example.jsonc`](settings.example.jsonc) contains every supported field with inline comments — save modes, timeouts, proxy, and provider shapes (OpenAI-compatible relay, OpenAI direct, Gemini/Imagen, local server). A copy lives at `~/.pi/agent/settings/pi-image-gen.example.jsonc` for reference while editing.
 
 The loader accepts JSONC: `//` line comments, `/* */` block comments and trailing commas are stripped before parsing, so the example can be pasted straight into your config. Both `pi-image-gen.json` and `pi-image-gen.jsonc` are read (`.json` first), globally and per project.
 
-Picks made through `/image-model` store the last selection in `pi-image-gen.state.json`. Importing a model also writes it into the global `pi-image-gen.json[c]`, which rewrites that file and drops JSONC comments.
+Picks made through `/image-model` store the last selection in `pi-image-gen.state.json`. Adding, editing or importing a model writes it into the global `pi-image-gen.json[c]`, which rewrites that file and drops JSONC comments. Press `j` in `/image-model` to edit that file as JSON.
 
 Two rules that surprise people:
 
-- Declaring any `providers` entry replaces the built-in model catalog. Importing adds one, so import every model you need or keep your own `providers` list complete.
+- `providers` is the complete model list. Every model you want must be declared there; there is no fallback catalog.
 - `saveDir` is used verbatim — `~` is not expanded. Use an absolute path.
 
 ### Custom Models via Settings
@@ -201,7 +225,7 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) o
 }
 ```
 
-Model entries accept `responseFormat`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize` — the fields the import wizard writes. `api` can be set per model to override the provider.
+Model entries accept `responseFormat`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize` — the same fields the add/edit wizard writes. `api` can be set per model to override the provider.
 
 For providers whose signed image URLs require server-side authentication, set `responseFormat` to `b64_json`. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request to the provider.
 
@@ -212,10 +236,6 @@ For providers whose signed image URLs require server-side authentication, set `r
 | `google-generative-ai-image` | Google Gemini / Imagen | `POST /models/{id}:generateContent` for Gemini image models; `POST /models/{id}:predict` for `imagen-*` models |
 
 Model-level `api` overrides provider-level `api`.
-
-### Legacy: tagged `models.json` entries
-
-`pi-image-gen` still reads `providers.<name>.models[]` entries in `~/.pi/agent/models.json` that are tagged with `output: ["image"]` and model overrides tagged the same way. This is lower priority than the settings file and is only used when no plugin `providers` are declared. Pi ignores the tag, so prefer `/image-model`, which imports the model into the plugin config.
 
 ## Save Modes
 
@@ -250,8 +270,8 @@ The `generate_image` tool accepts:
 
 - **API keys & headers** — Values declared in the plugin `providers` win (imported models copy them from Pi); Pi's registry fills the rest via `ctx.modelRegistry.getApiKeyAndHeaders()` (env vars, auth.json, OAuth, `models.json`)
 - **Base URLs** — From the plugin `providers`, then Pi's `models.json` (provider or model level), then Pi's registry
-- **Model list** — Pi `models.json` providers (for import) plus the plugin config catalog
-- **Custom providers** — Define in `~/.pi/agent/settings/pi-image-gen.json` or import a `models.json` model with `/image-model`
+- **Model list** — the plugin `providers` config only; Pi `models.json` is read-only and used for importing models
+- **Custom providers** — Add with `/image-model` or define in `~/.pi/agent/settings/pi-image-gen.json`
 - **Image edits** — Use `imagePath` and optional `maskPath` with an `openai-images` model that has editing enabled; omitting `maskPath` in the TUI first asks whether to select a region
 - **Mask selection** — The browser selector can create a mask inside Pi's interactive edit flow
 
@@ -261,24 +281,23 @@ Mirrors Pi's text model pipeline:
 
 | Layer | Pi (text) | pi-image-gen |
 |-------|-----------|--------------|
-| Build-time discovery | `generate-models.ts` → `models.generated.ts` | `generate-image-models.ts` → `image-models.generated.ts` |
-| Sources | models.dev, OpenRouter, AI Gateway | Static catalog + models imported from Pi `models.json` |
-| Custom models | `models.json` providers | Imported Pi models and hand-written entries in `settings/pi-image-gen.json` + legacy tags |
+| Model sources | models.dev, OpenRouter, AI Gateway, `models.json` | `providers` in the plugin settings |
+| Custom models | `models.json` providers | `/image-model` add/edit or hand-written settings entries |
 | API key & header resolution | `ModelRegistry.getApiKeyAndHeaders()` | Plugin `providers` first, then `ModelRegistry.getApiKeyAndHeaders()` |
-| Model selection | Ctrl+P / model selector | `/image-model` (same picker layout) |
+| Model selection | Ctrl+P / model selector | `/image-model` (search + list focus, add/edit/delete) |
 
-### Model Priority (lowest → highest)
+### Model Priority
 
-1. **Built-in generated** — `image-models.generated.ts` (baked into package)
-2. **Legacy `models.json` tags** — `providers.<name>.models[]` entries with `output: ["image"]`
-3. **Settings providers** — `providers` in `pi-image-gen.json`, including models imported by `/image-model`
-4. **Session selection** — `/image-model` command or tool params
+1. **Settings providers** — `providers` in `pi-image-gen.json` is the only source of models
+2. **Session selection** — `/image-model` overrides the saved defaults
+3. **Defaults** — `defaultProvider`/`defaultModel`, then the first configured model
 
 ## Adding Providers
 
-1. Import a model from `~/.pi/agent/models.json` with `/image-model`, or add a `providers` entry to `~/.pi/agent/settings/pi-image-gen.json`,
-2. or add static models to `scripts/generate-image-models.ts` and run `npm run generate-models`
-3. Add generation logic in `extensions/image-gen.ts` if a new API type is needed
+1. Press `a` in `/image-model` (custom model or import from Pi's `models.json`), or
+2. press `j` to edit the global settings as JSON, or
+3. add a `providers` entry to `~/.pi/agent/settings/pi-image-gen.json` by hand
+4. Add generation logic in `extensions/image-gen.ts` if a new API type is needed
 
 ## License
 

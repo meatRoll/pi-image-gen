@@ -1,5 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────────
-// pi-image-gen 1.3.0 — complete settings reference
+// pi-image-gen — complete settings reference
 //
 // The loader accepts JSONC, so this file can be used as-is: comments and
 // trailing commas are stripped before parsing. Name it either
@@ -11,9 +11,8 @@
 //
 // Two things bite people, so read these first:
 //
-//   1. Declaring ANY provider here replaces the built-in model catalog
-//      (gpt-image-1, dall-e-3, Gemini, Imagen). List every provider you want.
-//      Models imported by /image-model are written here as providers too.
+//   1. This is the complete model list. There is no built-in catalog, so add
+//      every model you want — with /image-model, or by hand below.
 //   2. `saveDir` is used verbatim: "~" is NOT expanded. Use an absolute path.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -21,7 +20,7 @@
   // Which model is used when the session has no /image-model selection.
   // defaultModel is matched by id across all providers and wins over
   // defaultProvider; defaultProvider then falls back to that provider's
-  // first model. With neither set, the first `openai` model is used.
+  // first model. With neither set, the first configured model is used.
   "defaultProvider": "my-relay",
   "defaultModel": "image-model-1",
 
@@ -120,7 +119,7 @@
 //
 // • Model resolution order:
 //     /image-model selection → defaultModel → defaultProvider's first model
-//     → first `openai` model → any model
+//     → first configured model
 //
 // • Tool parameters override settings per call: save, saveDir, timeout,
 //   aspectRatio (1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9),
@@ -131,13 +130,10 @@
 //   the image bytes instead of a URL you may not be able to fetch. Note that
 //   many relays ignore it and inline a data URL anyway — both are handled.
 //
-// • Legacy alternative: entries in ~/.pi/agent/models.json tagged with
-//   "output": ["image"] (optionally "imageApi"/"imageCost") are still read,
-//   but only when no `providers` are declared here.
-//
-// • `/image-model` imports a model from Pi's ~/.pi/agent/models.json into
-//   this file. It writes a normal providers entry, copying baseUrl, apiKey
-//   and headers from Pi and asking for the image options first:
+// • `/image-model` can add, edit and delete models. "Add → Custom model…"
+//   writes an entry here directly; "Add → From Pi's models.json…" copies the
+//   selected model's baseUrl, apiKey and headers from Pi. Both ask for the
+//   image options first:
 //
 //     "models": [
 //       {
@@ -151,8 +147,10 @@
 //       }
 //     ]
 //
-//   Importing rewrites this file, so JSONC comments and formatting are lost.
-//   Imported entries are managed independently; later changes in Pi's
-//   models.json are not synced. The last /image-model selection is stored in
+//   Any add/edit/import rewrites this file, so JSONC comments and formatting
+//   are lost. Imported entries are managed independently; later changes in
+//   Pi's models.json are not synced. Press `j` in /image-model to edit this
+//   file as JSON, and Ctrl+G on any field to ask the current chat model for a
+//   suggestion. The last selection is stored in
 //   ~/.pi/agent/settings/pi-image-gen.state.json.
 // ─────────────────────────────────────────────────────────────────────────────
