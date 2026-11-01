@@ -1701,6 +1701,43 @@ function parseAiReply(text: string): AiSuggestion | undefined {
   }
 }
 
+interface AiLoadingHandle {
+  closed: Promise<void>;
+  close(cancelled: boolean): void;
+  cancelled(): boolean;
+}
+
+/** Show the "asking" state immediately, then close it when the request ends. */
+function openAiLoading(ctx: ExtensionContext, model: PiChatModel): AiLoadingHandle {
+  let closeOverlay: ((cancelled: boolean) => void) | undefined;
+  let wasCancelled = false;
+  const closed = ctx.ui.custom<void>((_tui, theme, _kb, done) => {
+    const box = new Container();
+    box.addChild(new DynamicBorder());
+    box.addChild(new Text(theme.fg("accent", "Asking AI…"), 0, 0));
+    box.addChild(new Text(theme.fg("muted", `${model.provider}/${model.id}`), 0, 0));
+    box.addChild(new Spacer(1));
+    box.addChild(new Text(theme.fg("muted", "Esc cancel · the field stays underneath"), 0, 0));
+    box.addChild(new DynamicBorder());
+    closeOverlay = (cancelled: boolean) => {
+      if (cancelled) wasCancelled = true;
+      done(undefined);
+    };
+    return {
+      render(width: number) { return box.render(width); },
+      invalidate() { box.invalidate(); },
+      handleInput(data: string) {
+        if (matchesKey(data, "escape")) closeOverlay?.(true);
+      },
+    };
+  }, { overlay: true, overlayOptions: { width: "60%", maxHeight: 6, margin: 1 } });
+  return {
+    closed,
+    close: (cancelled) => closeOverlay?.(cancelled),
+    cancelled: () => wasCancelled,
+  };
+}
+
 async function requestAiSuggestion(ctx: ExtensionContext, spec: AiFieldSpec): Promise<AiSuggestion | undefined> {
   if (!ctx.hasUI) return undefined;
   const model = ctx.model;
@@ -1712,7 +1749,7 @@ async function requestAiSuggestion(ctx: ExtensionContext, spec: AiFieldSpec): Pr
     ctx.ui.notify(`AI help needs configured auth for ${model.provider}/${model.id}.`, "warning");
     return undefined;
   }
-  ctx.ui.notify(`Asking ${model.provider}/${model.id} for a suggestion…`, "info");
+  const loading = openAiLoading(ctx, model);
   try {
     const response = await ctx.modelRegistry.complete(model, {
       messages: [
@@ -1723,6 +1760,9 @@ async function requestAiSuggestion(ctx: ExtensionContext, spec: AiFieldSpec): Pr
         },
       ],
     });
+    loading.close(false);
+    await loading.closed;
+    if (loading.cancelled()) return undefined;
     const text = response.content
       .filter((content): content is { type: "text"; text: string } => content.type === "text")
       .map((content) => content.text)
@@ -1739,6 +1779,9 @@ async function requestAiSuggestion(ctx: ExtensionContext, spec: AiFieldSpec): Pr
     }
     return { ...parsed, value: normalized };
   } catch (error) {
+    loading.close(false);
+    await loading.closed;
+    if (loading.cancelled()) return undefined;
     ctx.ui.notify(`AI suggestion failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
     return undefined;
   }
