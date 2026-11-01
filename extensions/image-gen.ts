@@ -1347,7 +1347,7 @@ async function pickImageModel(
 
     function footerText(): string {
       if (focus === "search") {
-        return "SEARCH · type to filter · Tab/↓ list · Enter select · Esc clear/close";
+        return "SEARCH · type to filter · Tab/↓/Enter list · Esc clear/close";
       }
       return actions
         ? "LIST · ↑↓ move · Enter select · a add · e edit · d delete · j JSON · Tab/↑ search · Esc close"
@@ -1447,8 +1447,13 @@ async function pickImageModel(
     }
 
     searchInput.onSubmit = () => {
-      const item = filteredItems[selectedIndex];
-      if (item) done({ kind: "select", item });
+      // Enter in the search box only moves focus to the list. Selecting here
+      // would close the picker and make a search confirmation unexpectedly
+      // choose the first result.
+      if (filteredItems.length === 0) return;
+      focus = "list";
+      updateFocus();
+      tui.requestRender();
     };
 
     const container = new Container();

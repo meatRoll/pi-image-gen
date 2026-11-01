@@ -87,7 +87,7 @@ There is no built-in catalog: `/image-model` lists exactly the models declared u
 
 The picker has two focus areas, and the footer changes with the focused one. The active area is marked with `▸`, and the footer starts with `SEARCH` or `LIST`. The input cursor block only appears while search is focused; the `→` row marker only appears while the list is focused.
 
-- **Search** (top) — type to filter; `Tab` or `↓` moves focus to the list.
+- **Search** (top) — type to filter; `Tab`, `↓`, or `Enter` moves focus to the list.
 - **List** (bottom) — `↑↓` move, `Enter` select, `a` add, `e` edit, `d` delete, `j` JSON mode, `Tab` or `↑` back to search.
 
 #### Add
