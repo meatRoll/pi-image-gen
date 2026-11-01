@@ -1706,8 +1706,11 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
     const history: Message[] = [];
     let streaming = false;
     let controller: AbortController | undefined;
+    let copyMode = false;
     let scrollFromBottom = 0;
+    let copyScrollFromBottom = 0;
     let maxScroll = 0;
+    let maxCopyScroll = 0;
     let visibleTranscriptHeight = 3;
     // Leave room for the title, context line, input, footer and borders.
     const maxTranscriptHeight = Math.max(4, Math.min(12, tui.terminal.rows - 11));
@@ -1735,14 +1738,31 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       return lines;
     }
 
+    function buildCopyView(width: number): string[] {
+      if (chat.length === 0) return [""];
+      const lines: string[] = [];
+      for (const entry of chat) {
+        const label = entry.role === "user" ? "You: " : "AI: ";
+        const text = entry.text || (streaming && entry.role === "assistant" ? "Thinking…" : "");
+        lines.push(...wrapTextWithAnsi(label + text, width));
+        lines.push("");
+      }
+      while (lines.at(-1) === "") lines.pop();
+      return lines;
+    }
+
+    function copyViewportHeight(): number {
+      return Math.max(3, Math.min(tui.terminal.rows - 2, Math.floor(tui.terminal.rows * 0.85) - 2));
+    }
+
     function updateFooter(): void {
       const scrollHint = scrollFromBottom > 0 ? ` · ${scrollFromBottom} lines back` : "";
       footer.setText(
         theme.fg(
           "muted",
           streaming
-            ? `Streaming… · Esc stop · Wheel/PgUp/PgDn scroll${scrollHint}`
-            : `Enter send · Wheel/PgUp/PgDn scroll${scrollHint} · Esc close`,
+            ? `Streaming… · Esc stop · Wheel/PgUp/PgDn scroll · Ctrl+O copy view${scrollHint}`
+            : `Enter send · Wheel/PgUp/PgDn scroll · Ctrl+O copy view${scrollHint} · Esc close`,
         ),
       );
     }
@@ -1819,7 +1839,7 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
         const wasAborted = aborted || controller?.signal.aborted === true;
         streaming = false;
         controller = undefined;
-        input.focused = true;
+        input.focused = !copyMode;
         if (wasAborted && answer.text && !answer.text.includes("[stopped]")) {
           answer.text += "\n\n[stopped]";
         }
@@ -1834,6 +1854,14 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
 
     return {
       render(width: number): string[] {
+        if (copyMode) {
+          const lines = buildCopyView(Math.max(1, width));
+          const viewport = copyViewportHeight();
+          maxCopyScroll = Math.max(0, lines.length - viewport);
+          if (copyScrollFromBottom > maxCopyScroll) copyScrollFromBottom = maxCopyScroll;
+          const start = Math.max(0, lines.length - viewport - copyScrollFromBottom);
+          return lines.slice(start, start + viewport);
+        }
         const frameWidth = Math.max(4, width);
         const bodyWidth = Math.max(1, frameWidth - 2);
         const contentWidth = Math.max(1, bodyWidth - 2);
@@ -1865,7 +1893,13 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
       handleMouse(event: TuiMouseEvent): TuiMouseEventResult | undefined {
         if (event.type !== "wheel") return undefined;
         const delta = event.wheelDelta ?? 0;
-        if (delta < 0) {
+        if (copyMode) {
+          if (delta < 0) {
+            copyScrollFromBottom = Math.min(maxCopyScroll, copyScrollFromBottom - delta);
+          } else if (delta > 0) {
+            copyScrollFromBottom = Math.max(0, copyScrollFromBottom - delta);
+          }
+        } else if (delta < 0) {
           scrollFromBottom = Math.min(maxScroll, scrollFromBottom - delta);
         } else if (delta > 0) {
           scrollFromBottom = Math.max(0, scrollFromBottom - delta);
@@ -1876,6 +1910,31 @@ async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: strin
         return { handled: true, render: true };
       },
       handleInput(data: string): void {
+        if (matchesKey(data, "ctrl+o")) {
+          copyMode = !copyMode;
+          if (copyMode) copyScrollFromBottom = 0;
+          input.focused = !copyMode && !streaming;
+          tui.requestRender();
+          return;
+        }
+        if (copyMode) {
+          if (matchesKey(data, "escape")) {
+            copyMode = false;
+            input.focused = !streaming;
+          } else if (kb.matches(data, "tui.select.pageUp")) {
+            copyScrollFromBottom = Math.min(
+              maxCopyScroll,
+              copyScrollFromBottom + Math.max(1, Math.floor(copyViewportHeight() / 2)),
+            );
+          } else if (kb.matches(data, "tui.select.pageDown")) {
+            copyScrollFromBottom = Math.max(
+              0,
+              copyScrollFromBottom - Math.max(1, Math.floor(copyViewportHeight() / 2)),
+            );
+          }
+          tui.requestRender();
+          return;
+        }
         if (matchesKey(data, "escape")) {
           if (streaming) {
             controller?.abort();
