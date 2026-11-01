@@ -32,6 +32,7 @@ import {
   fuzzyFilter,
   getImageDimensions,
   Input,
+  matchesKey,
   Spacer,
   Text,
 } from "@earendil-works/pi-tui";
@@ -1829,7 +1830,7 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
           if (option) done({ kind: "value", value: option.value });
         } else if (kb.matches(data, "tui.select.cancel")) {
           done(undefined);
-        } else if (spec.allowAi && data === "\x07") {
+        } else if (spec.allowAi && matchesKey(data, "ctrl+g")) {
           done({ kind: "ai" });
         }
         tui.requestRender();
@@ -1986,7 +1987,7 @@ async function askTextField(ctx: ExtensionContext, spec: TextUISpec): Promise<st
           handleInput(data: string) {
             if (kb.matches(data, "tui.select.cancel")) {
               done(undefined);
-            } else if (spec.ai && data === "\x07") {
+            } else if (spec.ai && matchesKey(data, "ctrl+g")) {
               done({ kind: "ai" });
             } else {
               input.handleInput(data);
