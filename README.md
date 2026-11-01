@@ -13,7 +13,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 - 🎨 **Model management** — add, edit and delete models from `/image-model`; every model lives in the plugin settings
 - 🗂️ **Import from Pi's `models.json`** — list the models exposed by providers in Pi's config and copy the selected one into the plugin
 - 🧭 **Add/edit wizard** — choose the image API, response format, editing support, defaults, base URL, key and multi-line headers
-- ✨ **AI field help** — press `Ctrl+G` on any field to ask the current chat model for a suggestion
+- ✨ **AI field help** — press `Ctrl+G` on any field to open a streaming chat popup for questions and follow-ups
 - 🧾 **JSON mode** — press `j` to edit the whole global settings file in a multi-line editor
 - 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
@@ -124,7 +124,7 @@ Provider fields affect every model in that provider. Changing a model ID checks 
 
 #### AI help
 
-Press `Ctrl+G` on any text or select field to ask the current chat model for a field-level suggestion. A small "Asking AI…" popup appears immediately, then the suggestion opens as a floating popup over the field, so the form stays visible underneath. The suggestion includes a reason and confidence; apply it, ask again, or enter a value manually. AI never runs automatically, never touches `apiKey`, and never receives credentials. If the current model has no configured auth, the field falls back to manual entry.
+Press `Ctrl+G` on any text or select field to open a streaming chat popup for that field. The form stays visible underneath. Type a question and press `Enter`; the answer streams into the popup and you can keep asking follow-ups. Nothing is applied automatically: copy any value you want into the field yourself. `Esc` stops an in-flight answer, and `Esc` again closes the popup. AI never receives `apiKey` or secret header values. If the current model has no configured auth, AI help is unavailable and the field stays in manual mode.
 
 #### JSON mode
 

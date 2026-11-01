@@ -150,8 +150,7 @@
 //   Any add/edit/import rewrites this file, so JSONC comments and formatting
 //   are lost. Imported entries are managed independently; later changes in
 //   Pi's models.json are not synced. Press `j` in /image-model to edit this
-//   file as JSON, and Ctrl+G on any field to ask the current chat model for a
-//   suggestion in a floating popup.
-//   suggestion. The last selection is stored in
+//   file as JSON, and Ctrl+G on any field for a streaming AI chat popup.
+//   The last selection is stored in
 //   ~/.pi/agent/settings/pi-image-gen.state.json.
 // ─────────────────────────────────────────────────────────────────────────────

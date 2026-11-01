@@ -7,7 +7,7 @@
  * - Custom models via config files or JSON mode
  * - API keys and headers resolved from the plugin config first, then Pi's ModelRegistry
  * - /image-model command for selecting, adding, editing and deleting models
- * - Per-field AI suggestions via Ctrl+G using the current Pi chat model
+ * - Per-field streaming AI chat via Ctrl+G using the current Pi chat model
  * - Session-persisted selection via pi.appendEntry()
  *
  * API types:
@@ -26,7 +26,7 @@ import { tmpdir } from "node:os";
 import { convertToPng, DynamicBorder, getAgentDir, resizeImage } from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { AgentToolResult, AgentToolUpdateCallback } from "@earendil-works/pi-agent-core";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, AssistantMessage, Message, Model } from "@earendil-works/pi-ai";
 import {
   Container,
   fuzzyFilter,
@@ -35,8 +35,8 @@ import {
   matchesKey,
   Spacer,
   Text,
+  wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import type { OverlayOptions } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import type { Static } from "typebox";
 const execFileAsync = promisify(execFile);
@@ -1571,12 +1571,6 @@ interface AiFieldSpec {
   current?: unknown;
 }
 
-interface AiSuggestion {
-  value: unknown;
-  reason?: string;
-  confidence?: string;
-}
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
 }
@@ -1587,57 +1581,40 @@ function isStringRecord(value: unknown): value is Record<string, string> {
 
 const SECRET_HEADER = /authorization|api[-_]?key|cookie|token|secret/i;
 
-function normalizeAiValue(kind: AiFieldKind, raw: unknown): unknown | undefined {
+function aiAllowedValues(kind: AiFieldKind): string {
   switch (kind) {
     case "api":
-      return raw === "openai-images" || raw === "google-generative-ai-image" ? raw : undefined;
+      return "openai-images | google-generative-ai-image";
     case "responseFormat":
-      return raw === "url" || raw === "b64_json" ? raw : undefined;
+      return "url | b64_json";
     case "boolean":
-      if (raw === true || raw === "true" || raw === "yes") return true;
-      if (raw === false || raw === "false" || raw === "no") return false;
-      return undefined;
+      return "true | false";
     case "aspect":
-      if (raw === null || raw === "" || raw === "not set") return null;
-      return typeof raw === "string" && (ASPECT_RATIO_OPTIONS as readonly string[]).includes(raw) ? raw : undefined;
+      return `null | ${ASPECT_RATIO_OPTIONS.join(" | ")}`;
     case "size":
-      if (raw === null || raw === "" || raw === "not set") return null;
-      return raw === "1K" || raw === "2K" || raw === "4K" ? raw : undefined;
+      return "null | 1K | 2K | 4K";
+    case "headers":
+      return "an object of non-secret header names to string values";
+    case "url":
+      return "an http(s) URL";
+    case "id":
+      return "a non-empty model ID string";
     case "text":
-    case "id": {
-      if (typeof raw !== "string") return undefined;
-      const value = raw.trim();
-      return value.length > 0 ? value : undefined;
-    }
-    case "url": {
-      if (typeof raw !== "string" || !raw.trim()) return undefined;
-      try {
-        const url = new URL(raw.trim());
-        return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : undefined;
-      } catch {
-        return undefined;
-      }
-    }
-    case "headers": {
-      if (!isRecord(raw)) return undefined;
-      const headers: Record<string, string> = {};
-      for (const [name, value] of Object.entries(raw)) {
-        if (typeof value !== "string") return undefined;
-        if (SECRET_HEADER.test(name)) return undefined;
-        headers[name] = value;
-      }
-      return headers;
-    }
+      return "a string";
   }
 }
 
-function formatAiValue(value: unknown): string {
-  if (value === null) return "not set";
-  if (typeof value === "string") return value;
-  return JSON.stringify(value);
+/** Current headers may include credentials; never put those in an AI prompt. */
+function aiSafeCurrent(spec: AiFieldSpec): unknown {
+  if (spec.kind === "headers" && isRecord(spec.current)) {
+    return Object.fromEntries(
+      Object.entries(spec.current).filter(([name]) => !SECRET_HEADER.test(name)),
+    );
+  }
+  return spec.current;
 }
 
-function aiPrompt(spec: AiFieldSpec): string {
+function aiChatSystemPrompt(spec: AiFieldSpec): string {
   const context = {
     provider: spec.context.provider,
     baseUrl: spec.context.baseUrl,
@@ -1654,137 +1631,248 @@ function aiPrompt(spec: AiFieldSpec): string {
         }
       : undefined,
     currentOptions: spec.context.options,
-    currentValue: spec.current ?? null,
+    currentValue: aiSafeCurrent(spec) ?? null,
   };
-  const allowed = spec.kind === "api"
-    ? "openai-images | google-generative-ai-image"
-    : spec.kind === "responseFormat"
-      ? "url | b64_json"
-      : spec.kind === "boolean"
-        ? "true | false"
-        : spec.kind === "aspect"
-          ? `null | ${ASPECT_RATIO_OPTIONS.join(" | ")}`
-          : spec.kind === "size"
-            ? "null | 1K | 2K | 4K"
-            : spec.kind === "headers"
-              ? "an object of header names to string values"
-              : "a string";
   return [
-    "You are helping configure an image-generation model in Pi's pi-image-gen extension.",
-    "Answer with ONE JSON object only, no markdown fences:",
-    '{"value": <suggested value>, "reason": "<one short sentence>", "confidence": "high|medium|low"}',
+    "You are an AI assistant helping configure an image-generation model in Pi's pi-image-gen extension.",
+    "Answer the user's questions about the field. Be concise and practical.",
+    "You may propose a concrete value, but do not claim to apply it; the user copies values manually.",
+    "Never ask for, repeat, or invent credentials or secret header values (Authorization, API keys, cookies, tokens).",
     "",
     `Field: ${spec.field}`,
     `Guidance: ${spec.guidance}`,
-    `Allowed values: ${allowed}`,
+    `Allowed values: ${aiAllowedValues(spec.kind)}`,
+    `Current value: ${JSON.stringify(aiSafeCurrent(spec) ?? null)}`,
     `Context: ${JSON.stringify(context)}`,
-    "Never propose credentials or secret header values (Authorization, API keys, cookies, tokens).",
-    "If you do not know, return a conservative value and low confidence.",
   ].join("\n");
 }
 
-function parseAiReply(text: string): AiSuggestion | undefined {
-  const cleaned = text.replace(/```(?:json)?/gi, "").trim();
-  const start = cleaned.indexOf("{");
-  const end = cleaned.lastIndexOf("}");
-  if (start === -1 || end <= start) return undefined;
-  try {
-    const parsed = JSON.parse(cleaned.slice(start, end + 1)) as Record<string, unknown>;
-    if (!("value" in parsed)) return undefined;
-    return {
-      value: parsed.value,
-      reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
-      confidence: typeof parsed.confidence === "string" ? parsed.confidence : undefined,
-    };
-  } catch {
-    return undefined;
-  }
+interface AiChatEntry {
+  role: "user" | "assistant";
+  text: string;
 }
 
-interface AiLoadingHandle {
-  closed: Promise<void>;
-  close(cancelled: boolean): void;
-  cancelled(): boolean;
-}
-
-/** Show the "asking" state immediately, then close it when the request ends. */
-function openAiLoading(ctx: ExtensionContext, model: PiChatModel): AiLoadingHandle {
-  let closeOverlay: ((cancelled: boolean) => void) | undefined;
-  let wasCancelled = false;
-  const closed = ctx.ui.custom<void>((_tui, theme, _kb, done) => {
-    const box = new Container();
-    box.addChild(new DynamicBorder());
-    box.addChild(new Text(theme.fg("accent", "Asking AI…"), 0, 0));
-    box.addChild(new Text(theme.fg("muted", `${model.provider}/${model.id}`), 0, 0));
-    box.addChild(new Spacer(1));
-    box.addChild(new Text(theme.fg("muted", "Esc cancel · the field stays underneath"), 0, 0));
-    box.addChild(new DynamicBorder());
-    closeOverlay = (cancelled: boolean) => {
-      if (cancelled) wasCancelled = true;
-      done(undefined);
-    };
-    return {
-      render(width: number) { return box.render(width); },
-      invalidate() { box.invalidate(); },
-      handleInput(data: string) {
-        if (matchesKey(data, "escape")) closeOverlay?.(true);
-      },
-    };
-  }, { overlay: true, overlayOptions: { width: "60%", maxHeight: 6, margin: 1 } });
-  return {
-    closed,
-    close: (cancelled) => closeOverlay?.(cancelled),
-    cancelled: () => wasCancelled,
-  };
-}
-
-async function requestAiSuggestion(ctx: ExtensionContext, spec: AiFieldSpec): Promise<AiSuggestion | undefined> {
-  if (!ctx.hasUI) return undefined;
+/** A streaming, multi-turn consultation popup. It never applies a value. */
+async function openAiChat(ctx: ExtensionContext, spec: AiFieldSpec, title: string): Promise<void> {
+  if (!ctx.hasUI) return;
   const model = ctx.model;
   if (!model) {
     ctx.ui.notify("AI help needs a current chat model.", "warning");
-    return undefined;
+    return;
   }
   if (!ctx.modelRegistry.hasConfiguredAuth(model)) {
     ctx.ui.notify(`AI help needs configured auth for ${model.provider}/${model.id}.`, "warning");
-    return undefined;
+    return;
   }
-  const loading = openAiLoading(ctx, model);
-  try {
-    const response = await ctx.modelRegistry.complete(model, {
-      messages: [
-        {
-          role: "user",
-          content: [{ type: "text", text: aiPrompt(spec) }],
-          timestamp: Date.now(),
-        },
-      ],
+  const chatModel = model;
+
+  const systemPrompt = aiChatSystemPrompt(spec);
+  await ctx.ui.custom<void>((tui, theme, kb, done) => {
+    const input = new FocusAwareInput({
+      prompt: theme.fg("accent", "› "),
+      placeholder: "Ask about this field…",
     });
-    loading.close(false);
-    await loading.closed;
-    if (loading.cancelled()) return undefined;
-    const text = response.content
-      .filter((content): content is { type: "text"; text: string } => content.type === "text")
-      .map((content) => content.text)
-      .join("\n");
-    const parsed = parseAiReply(text);
-    if (!parsed) {
-      ctx.ui.notify("AI returned no usable suggestion.", "warning");
-      return undefined;
+    input.focused = true;
+
+    const current = aiSafeCurrent(spec);
+    const header = new Text(theme.fg("accent", `AI help — ${title}`), 0, 0);
+    const contextLine = new Text(
+      theme.fg(
+        "muted",
+        `Current: ${current === undefined ? "not set" : JSON.stringify(current)} · Allowed: ${aiAllowedValues(spec.kind)}`,
+      ),
+      0,
+      0,
+    );
+    const transcriptView = new Text("", 0, 0);
+    const footer = new Text("", 0, 0);
+
+    const container = new Container();
+    container.addChild(new DynamicBorder());
+    container.addChild(header);
+    container.addChild(contextLine);
+    container.addChild(new Spacer(1));
+    container.addChild(transcriptView);
+    container.addChild(new Spacer(1));
+    container.addChild(input);
+    container.addChild(footer);
+    container.addChild(new DynamicBorder());
+
+    const chat: AiChatEntry[] = [];
+    const history: Message[] = [];
+    let streaming = false;
+    let controller: AbortController | undefined;
+    let scrollFromBottom = 0;
+    let maxScroll = 0;
+    let visibleTranscriptHeight = 3;
+    // Leave room for the title, context line, input, footer and borders.
+    const maxTranscriptHeight = Math.max(4, Math.min(12, tui.terminal.rows - 11));
+
+    function buildTranscript(width: number): string[] {
+      if (chat.length === 0) {
+        return wrapTextWithAnsi(
+          theme.fg("muted", "Ask a question. Answers are not applied automatically; copy what you need."),
+          width,
+        );
+      }
+      const lines: string[] = [];
+      for (const entry of chat) {
+        const label = entry.role === "user"
+          ? theme.fg("accent", "You: ")
+          : theme.fg("success", "AI: ");
+        const body = entry.text || (streaming && entry.role === "assistant" ? theme.fg("muted", "Thinking…") : "");
+        const cursor = streaming && entry.role === "assistant" && entry.text
+          ? theme.fg("accent", "▍")
+          : "";
+        lines.push(...wrapTextWithAnsi(label + body + cursor, width));
+        lines.push("");
+      }
+      while (lines.at(-1) === "") lines.pop();
+      return lines;
     }
-    const normalized = normalizeAiValue(spec.kind, parsed.value);
-    if (normalized === undefined) {
-      ctx.ui.notify(`AI suggested an invalid ${spec.field} value: ${formatAiValue(parsed.value)}`, "warning");
-      return undefined;
+
+    function updateFooter(): void {
+      const scrollHint = scrollFromBottom > 0 ? ` · ${scrollFromBottom} lines back` : "";
+      footer.setText(
+        theme.fg(
+          "muted",
+          streaming
+            ? `Streaming… · Esc stop · PgUp/PgDn scroll${scrollHint}`
+            : `Enter send · PgUp/PgDn scroll${scrollHint} · Esc close`,
+        ),
+      );
     }
-    return { ...parsed, value: normalized };
-  } catch (error) {
-    loading.close(false);
-    await loading.closed;
-    if (loading.cancelled()) return undefined;
-    ctx.ui.notify(`AI suggestion failed: ${error instanceof Error ? error.message : String(error)}`, "warning");
-    return undefined;
-  }
+
+    async function send(): Promise<void> {
+      if (streaming) return;
+      const question = input.getValue().trim();
+      if (!question) return;
+
+      input.setValue("");
+      input.focused = false;
+      chat.push({ role: "user", text: question });
+      const answer: AiChatEntry = { role: "assistant", text: "" };
+      chat.push(answer);
+      const userMessage: Message = { role: "user", content: question, timestamp: Date.now() };
+      history.push(userMessage);
+      streaming = true;
+      scrollFromBottom = 0;
+      controller = new AbortController();
+      let finalMessage: AssistantMessage | undefined;
+      let failed = false;
+      let aborted = false;
+
+      try {
+        const stream = ctx.modelRegistry.streamSimple(chatModel, {
+          systemPrompt,
+          messages: history,
+        }, { signal: controller.signal });
+
+        for await (const event of stream) {
+          if (event.type === "text_delta") {
+            answer.text += event.delta;
+          } else if (event.type === "done") {
+            finalMessage = event.message;
+            if (controller.signal.aborted) aborted = true;
+          } else if (event.type === "error") {
+            if (event.reason === "aborted") {
+              aborted = true;
+              if (answer.text) answer.text += "\n\n[stopped]";
+            } else {
+              failed = true;
+              const message = event.error.errorMessage ?? "AI request failed.";
+              answer.text = answer.text
+                ? `${answer.text}\n\n[error: ${message}]`
+                : `Error: ${message}`;
+            }
+          }
+          tui.requestRender();
+        }
+
+        if (finalMessage) {
+          const text = finalMessage.content
+            .filter((content): content is { type: "text"; text: string } => content.type === "text")
+            .map((content) => content.text)
+            .join("\n");
+          if (text) answer.text = text;
+          const wasAborted = aborted || controller.signal.aborted;
+          if (!failed && !wasAborted && finalMessage.stopReason !== "aborted" && finalMessage.stopReason !== "error") {
+            history.push(finalMessage);
+          }
+        }
+      } catch (error) {
+        if (controller?.signal.aborted) {
+          aborted = true;
+          if (answer.text) answer.text += "\n\n[stopped]";
+        } else {
+          failed = true;
+          const message = error instanceof Error ? error.message : String(error);
+          answer.text = answer.text
+            ? `${answer.text}\n\n[error: ${message}]`
+            : `Error: ${message}`;
+        }
+      } finally {
+        const wasAborted = aborted || controller?.signal.aborted === true;
+        streaming = false;
+        controller = undefined;
+        input.focused = true;
+        if (wasAborted && answer.text && !answer.text.includes("[stopped]")) {
+          answer.text += "\n\n[stopped]";
+        }
+        if (!answer.text) answer.text = wasAborted ? "(stopped)" : "(no response)";
+        tui.requestRender();
+      }
+    }
+
+    input.onSubmit = () => {
+      void send();
+    };
+
+    return {
+      render(width: number): string[] {
+        const innerWidth = Math.max(20, width - 2);
+        const lines = buildTranscript(innerWidth);
+        visibleTranscriptHeight = Math.min(maxTranscriptHeight, Math.max(3, lines.length));
+        maxScroll = Math.max(0, lines.length - visibleTranscriptHeight);
+        if (scrollFromBottom > maxScroll) scrollFromBottom = maxScroll;
+        const start = Math.max(0, lines.length - visibleTranscriptHeight - scrollFromBottom);
+        const visible = lines.slice(start, start + visibleTranscriptHeight);
+        while (visible.length < visibleTranscriptHeight) visible.push("");
+        transcriptView.setText(visible.join("\n"));
+        updateFooter();
+        return container.render(width);
+      },
+      invalidate(): void {
+        container.invalidate();
+      },
+      handleInput(data: string): void {
+        if (matchesKey(data, "escape")) {
+          if (streaming) {
+            controller?.abort();
+          } else {
+            done(undefined);
+          }
+          tui.requestRender();
+          return;
+        }
+        if (kb.matches(data, "tui.select.pageUp")) {
+          scrollFromBottom = Math.min(maxScroll, scrollFromBottom + Math.max(1, Math.floor(visibleTranscriptHeight / 2)));
+          tui.requestRender();
+          return;
+        }
+        if (kb.matches(data, "tui.select.pageDown")) {
+          scrollFromBottom = Math.max(0, scrollFromBottom - Math.max(1, Math.floor(visibleTranscriptHeight / 2)));
+          tui.requestRender();
+          return;
+        }
+        if (!streaming) input.handleInput(data);
+        tui.requestRender();
+      },
+    };
+  }, {
+    overlay: true,
+    overlayOptions: { width: "85%", maxHeight: "85%", margin: 1 },
+  });
 }
 
 // ── Basic select and text fields (Ctrl+G asks the current chat model) ──
@@ -1798,18 +1886,9 @@ interface SelectUISpec<T> {
   /** Initial focus when the menu is an action list with no current value. */
   initial?: T;
   allowAi?: boolean;
-  /** Render this menu as a floating overlay instead of replacing the editor. */
-  overlay?: boolean;
-  overlayOptions?: OverlayOptions;
 }
 
 type SelectUIResult<T> = { kind: "value"; value: T } | { kind: "ai" };
-
-const AI_POPUP_OPTIONS: OverlayOptions = {
-  width: "80%",
-  maxHeight: "85%",
-  margin: 1,
-};
 
 async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promise<SelectUIResult<T> | undefined> {
   if (!ctx.hasUI) return undefined;
@@ -1861,7 +1940,7 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
     footer.setText(
       theme.fg(
         "muted",
-        `↑↓ move · Enter select${spec.allowAi ? " · Ctrl+G Ask AI" : ""} · Esc cancel`,
+        `↑↓ move · Enter select${spec.allowAi ? " · Ctrl+G AI chat" : ""} · Esc cancel`,
       ),
     );
     updateList();
@@ -1889,9 +1968,7 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
         tui.requestRender();
       },
     };
-  }, spec.overlay
-    ? { overlay: true, overlayOptions: spec.overlayOptions ?? AI_POPUP_OPTIONS }
-    : undefined);
+  });
 }
 
 /** Ask a select field. Ctrl+G asks the current model for a suggestion. */
@@ -1907,43 +1984,7 @@ async function askChoiceField<T>(
         mode = "select";
         continue;
       }
-      const suggestion = await requestAiSuggestion(ctx, spec.ai);
-      if (!suggestion) {
-        mode = "select";
-        continue;
-      }
-      const option = spec.options.find((item) => Object.is(item.value, suggestion.value));
-      if (!option) {
-        ctx.ui.notify(
-          `AI suggested ${formatAiValue(suggestion.value)}, which is not one of the available choices.`,
-          "warning",
-        );
-        mode = "select";
-        continue;
-      }
-      const gate = await selectUI<string>(ctx, {
-        title: `${spec.title} — AI suggestion`,
-        overlay: true,
-        note: [
-          `Use: ${option.label}`,
-          suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,
-          suggestion.confidence ? `Confidence: ${suggestion.confidence}` : undefined,
-        ].filter(Boolean).join("\n"),
-        options: [
-          { label: "Use this suggestion", value: "apply" },
-          { label: "Ask AI again", value: "retry" },
-          { label: "Choose manually", value: "manual" },
-        ],
-      });
-      if (!gate || gate.kind !== "value") {
-        mode = "select";
-        continue;
-      }
-      if (gate.value === "apply") return option.value;
-      if (gate.value === "retry") {
-        mode = "ai";
-        continue;
-      }
+      await openAiChat(ctx, { ...spec.ai, current: spec.ai.current ?? spec.current }, spec.title);
       mode = "select";
       continue;
     }
@@ -1977,39 +2018,7 @@ async function askTextField(ctx: ExtensionContext, spec: TextUISpec): Promise<st
         mode = "input";
         continue;
       }
-      const suggestion = await requestAiSuggestion(ctx, spec.ai);
-      if (!suggestion) {
-        mode = "input";
-        continue;
-      }
-      const suggested = formatAiValue(suggestion.value);
-      const gate = await selectUI<string>(ctx, {
-        title: `${spec.title} — AI suggestion`,
-        overlay: true,
-        note: [
-          `Use: ${suggested}`,
-          suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,
-          suggestion.confidence ? `Confidence: ${suggestion.confidence}` : undefined,
-        ].filter(Boolean).join("\n"),
-        options: [
-          { label: "Use this suggestion", value: "apply" },
-          { label: "Ask AI again", value: "retry" },
-          { label: "Enter manually", value: "manual" },
-        ],
-      });
-      if (!gate || gate.kind !== "value") {
-        mode = "input";
-        continue;
-      }
-      if (gate.value === "apply") {
-        value = suggested;
-        mode = "input";
-        continue;
-      }
-      if (gate.value === "retry") {
-        mode = "ai";
-        continue;
-      }
+      await openAiChat(ctx, { ...spec.ai, current: spec.ai.current ?? spec.value }, spec.title);
       mode = "input";
       continue;
     }
@@ -2031,7 +2040,7 @@ async function askTextField(ctx: ExtensionContext, spec: TextUISpec): Promise<st
         container.addChild(new Spacer(1));
         container.addChild(
           new Text(
-            theme.fg("muted", `Enter confirm${spec.ai ? " · Ctrl+G Ask AI" : ""} · Esc cancel`),
+            theme.fg("muted", `Enter confirm${spec.ai ? " · Ctrl+G AI chat" : ""} · Esc cancel`),
             0,
             0,
           ),
@@ -2081,40 +2090,13 @@ async function askHeaders(
   let headerDraft = JSON.stringify(current ?? {}, null, 2);
   while (true) {
     if (mode === "ai") {
-      const suggestion = await requestAiSuggestion(ctx, {
+      await openAiChat(ctx, {
         kind: "headers",
         field: "headers",
         guidance: "Suggest only non-secret request headers such as User-Agent. Never include Authorization, cookies, API keys or tokens.",
         context: aiContext,
         current: current ?? {},
-      });
-      if (!suggestion) {
-        mode = "select";
-        continue;
-      }
-      const gate = await selectUI<string>(ctx, {
-        title: "Request headers — AI suggestion",
-        overlay: true,
-        note: [
-          `Use: ${formatAiValue(suggestion.value)}`,
-          suggestion.reason ? `Reason: ${suggestion.reason}` : undefined,
-          suggestion.confidence ? `Confidence: ${suggestion.confidence}` : undefined,
-        ].filter(Boolean).join("\n"),
-        options: [
-          { label: "Use these headers", value: "apply" },
-          { label: "Ask AI again", value: "retry" },
-          { label: "Edit manually", value: "manual" },
-        ],
-      });
-      if (!gate || gate.kind !== "value") {
-        mode = "select";
-        continue;
-      }
-      if (gate.value === "apply") return suggestion.value as Record<string, string>;
-      if (gate.value === "retry") {
-        mode = "ai";
-        continue;
-      }
+      }, "Request headers");
       mode = "select";
       continue;
     }
