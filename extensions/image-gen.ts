@@ -1748,7 +1748,10 @@ interface SelectUISpec<T> {
   title: string;
   note?: string;
   options: SelectOption<T>[];
+  /** The actual current field value; only this gets a checkmark. */
   current?: T;
+  /** Initial focus when the menu is an action list with no current value. */
+  initial?: T;
   allowAi?: boolean;
 }
 
@@ -1757,7 +1760,11 @@ type SelectUIResult<T> = { kind: "value"; value: T } | { kind: "ai" };
 async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promise<SelectUIResult<T> | undefined> {
   if (!ctx.hasUI) return undefined;
   return ctx.ui.custom<SelectUIResult<T> | undefined>((tui, theme, kb, done) => {
-    let selectedIndex = Math.max(0, spec.options.findIndex((option) => Object.is(option.value, spec.current)));
+    const initialValue = spec.initial !== undefined ? spec.initial : spec.current;
+    const initialIndex = initialValue === undefined
+      ? -1
+      : spec.options.findIndex((option) => Object.is(option.value, initialValue));
+    let selectedIndex = initialIndex >= 0 ? initialIndex : 0;
     const list = new Container();
     const footer = new Text("", 0, 0);
 
@@ -1865,7 +1872,6 @@ async function askChoiceField<T>(
           { label: "Ask AI again", value: "retry" },
           { label: "Choose manually", value: "manual" },
         ],
-        current: "apply",
       });
       if (!gate || gate.kind !== "value") {
         mode = "select";
@@ -1927,7 +1933,6 @@ async function askTextField(ctx: ExtensionContext, spec: TextUISpec): Promise<st
           { label: "Ask AI again", value: "retry" },
           { label: "Enter manually", value: "manual" },
         ],
-        current: "apply",
       });
       if (!gate || gate.kind !== "value") {
         mode = "input";
@@ -2036,7 +2041,6 @@ async function askHeaders(
           { label: "Ask AI again", value: "retry" },
           { label: "Edit manually", value: "manual" },
         ],
-        current: "apply",
       });
       if (!gate || gate.kind !== "value") {
         mode = "select";
@@ -2060,7 +2064,6 @@ async function askHeaders(
         { label: current && Object.keys(current).length > 0 ? "Keep current headers" : "Skip headers", value: "keep" },
         { label: "Edit headers as JSON (multi-line)…", value: "edit" },
       ],
-      current: "keep",
       allowAi: true,
     });
     if (!result) return undefined;
@@ -2553,7 +2556,6 @@ async function addCustomFlow(
   const providerChoice = await askChoiceField<ProviderChoice>(ctx, {
     title: "Add image model — provider",
     options: choices,
-    current: choices[0]?.value,
   });
   if (!providerChoice) return undefined;
 
@@ -2685,7 +2687,6 @@ async function addCustomFlow(
       { label: "Add model", value: true },
       { label: "Cancel", value: false },
     ],
-    current: true,
   });
   if (!confirmed) return undefined;
 
@@ -2843,7 +2844,7 @@ async function editFlow(
           { label: "Discard changes", value: "discard" },
           { label: "Continue editing", value: "continue" },
         ],
-        current: "continue",
+        initial: "continue",
       });
       if (decision === "save") return await save();
       if (decision === "discard") return undefined;
@@ -3048,7 +3049,6 @@ async function editFlow(
             { label: "Replace…", value: "replace" },
             { label: "Clear", value: "clear" },
           ],
-          current: "keep",
         });
         if (choice === "replace") {
           const value = await askTextField(ctx, {
@@ -3106,7 +3106,7 @@ async function deleteFlow(
       { label: "Delete model", value: true },
       { label: "Cancel", value: false },
     ],
-    current: false,
+    initial: false,
   });
   if (!confirmed) return undefined;
 
@@ -3158,7 +3158,6 @@ async function jsonFlow(ctx: ExtensionContext): Promise<void> {
           { label: "Edit again", value: "edit" },
           { label: "Discard changes", value: "discard" },
         ],
-        current: "edit",
       });
       if (choice !== "edit") return;
       draft = edited;
@@ -3356,7 +3355,6 @@ export default function piImageGen(pi: ExtensionAPI) {
                 { label: "From Pi's models.json…", value: "pi" },
                 { label: "Cancel", value: "cancel" },
               ],
-              current: "custom",
             });
             if (!choice || choice === "cancel") continue;
             const added = choice === "custom"
