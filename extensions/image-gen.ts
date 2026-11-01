@@ -1792,8 +1792,10 @@ async function selectUI<T>(ctx: ExtensionContext, spec: SelectUISpec<T>): Promis
     const container = new Container();
     container.addChild(new DynamicBorder());
     container.addChild(new Text(theme.fg("accent", spec.title), 0, 0));
-    if (spec.note) container.addChild(new Text(theme.fg("muted", spec.note), 0, 0));
-    container.addChild(new Spacer(1));
+    if (spec.note) {
+      container.addChild(new Text(theme.fg("muted", spec.note), 0, 0));
+      container.addChild(new Spacer(1));
+    }
     container.addChild(list);
     container.addChild(new Spacer(1));
     container.addChild(footer);
