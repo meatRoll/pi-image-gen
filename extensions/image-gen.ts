@@ -3795,7 +3795,7 @@ export default function piImageGen(pi: ExtensionAPI) {
     label: "Generate image",
     description:
       "Generate an image from a text prompt, or edit a local input image when imagePath is supplied. Uses the selected image model, which is independent of Pi's current text model. " +
-      "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. After a mask is selected, a single editor asks for the edit prompt: typing text uses it, and submitting the empty editor accepts the prompt suggested here. Edits preserve the input image's framing and resolution. " +
+      "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. In interactive TUI mode, every edit then opens a single prompt editor prefilled with the agent's prompt, so the user can confirm or replace it before the request is sent. Edits preserve the input image's framing and resolution. " +
       "Pass maskPath only when a mask was already prepared. Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
     parameters: TOOL_PARAMS,
 
@@ -3890,39 +3890,43 @@ export default function piImageGen(pi: ExtensionAPI) {
       }
       if (inputImage) validateEditInputs(inputImage, maskImage);
 
-      // After the user has drawn a mask, ask for the prompt in a single editor.
-      // The earlier select dialog could confirm the first option on Enter while
-      // ignoring typed text; an empty submission still accepts the agent's
-      // suggestion, and leaving the editor blank is never required.
+      // After the edit area is known, give the user control over the prompt.
+      // The editor is prefilled with the agent's prompt; Enter accepts it as-is.
       let promptSource: "toolCall" | "suggested" | "custom" = "toolCall";
-      if (editScope === "region" && generatedMaskPath) {
+      if (inputImage && ctx.mode === "tui") {
         const suggestedPrompt = params.prompt.trim();
-        const title = suggestedPrompt
-          ? "Prompt for the selected area (empty = use the agent's suggestion)"
-          : "Prompt for the selected area";
+        const scopeLabel = editScope === "region"
+          ? "selected area"
+          : editScope === "provided"
+            ? "masked area"
+            : "whole image";
+        const titleFor = (value: string): string =>
+          value.trim()
+            ? `Edit prompt for the ${scopeLabel} (prefilled; Enter = use as-is)`
+            : `Edit prompt for the ${scopeLabel}`;
+        let draft = params.prompt;
         const readPrompt = async (): Promise<string | undefined> => {
-          const entered = await ctx.ui.editor(title, "");
-          return entered === undefined ? undefined : entered.trim();
+          const entered = await ctx.ui.editor(titleFor(draft), draft);
+          if (entered === undefined) return undefined;
+          draft = entered;
+          return entered.trim();
         };
 
         let customPrompt = await readPrompt();
         if (customPrompt === undefined) {
           return canceledEdit("Image edit canceled: prompt entry was canceled.");
         }
-        while (!customPrompt && !suggestedPrompt) {
+        while (!customPrompt) {
           ctx.ui.notify("Edit prompt cannot be empty.", "warning");
           customPrompt = await readPrompt();
           if (customPrompt === undefined) {
             return canceledEdit("Image edit canceled: prompt entry was canceled.");
           }
         }
-        if (customPrompt) {
-          prompt = customPrompt;
-          promptSource = "custom";
-        } else {
-          prompt = suggestedPrompt;
-          promptSource = "suggested";
-        }
+        prompt = customPrompt;
+        promptSource = customPrompt === suggestedPrompt
+          ? (editScope === "region" ? "suggested" : "toolCall")
+          : "custom";
       }
 
       const action = inputImage
@@ -3995,7 +3999,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       } else if (params.maskPath) {
         summary.push(`Mask: ${params.maskPath}.`);
       }
-      if (editScope === "region") {
+      if (inputImage) {
         summary.push(`Edit prompt${promptSource === "suggested" ? " (agent suggestion)" : ""}: ${prompt}`);
       }
       if (generatedMaskPath) summary.push(`Generated mask: ${generatedMaskPath}.`);

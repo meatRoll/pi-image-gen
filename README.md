@@ -20,7 +20,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 - 🖼️ **Aspect ratios & resolution** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` maps to Gemini's 1K/2K/4K tiers
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
 - 🎯 **`/image-model` command** — search/list focus, keyboard shortcuts, per-model options, and session persistence
-- 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, choose the suggested prompt or write a custom one
+- 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, confirm or edit the prefilled prompt
 
 ## Install
 
@@ -49,10 +49,10 @@ Pass a local image path through `imagePath` to edit an existing image. With an `
 In interactive Pi TUI mode, leave `maskPath` out. The extension first asks **“Select an edit area?”** and only launches a selector after you choose one:
 
 - **Launch browser mask tool (freehand lasso)** — opens a local browser canvas where you draw freehand lasso shapes around any area at source-pixel precision. Multiple areas, undo, and clear are supported.
-- **Edit whole image** — skip the mask and edit the full image.
+- **Edit whole image** — skip the mask and edit the full image; you still get the prompt editor.
 - **Cancel** — abort without calling the image API.
 
-After a region is saved, Pi opens a single editor for the edit prompt. Submit it empty to accept the agent's suggested prompt, or type a custom prompt. Press Enter to confirm, Shift+Enter for a newline, or Escape to cancel.
+In interactive TUI mode, after the edit area is chosen—whether a browser region, the whole image, or a provided mask—Pi opens a single editor prefilled with the agent's prompt. Edit it or press Enter to use it as-is; empty prompts are rejected. Press Shift+Enter for a newline, or Escape to cancel. The prompt that will be sent is echoed in the tool status and result summary.
 
 ```text
 > Edit `/tmp/source.png` into a watercolor illustration while preserving the composition.
@@ -66,7 +66,7 @@ The selected model must use the `openai-images` API type for image editing. Goog
 
 The interactive edit flow can launch a local browser canvas for freehand lasso selection. It does not depend on Pi's terminal-cell resolution and supports multiple shapes, undo, and clear at source-pixel precision.
 
-Drag to draw a loop around each area; release to close and fill it. Press Enter to save the mask or Escape to clear the current selection. After saving, Pi opens the same prompt editor described above. The selector attempts to close its browser tab automatically; if the browser blocks script-initiated tab closing, it shows a fallback message instead.
+Drag to draw a loop around each area; release to close and fill it. Press Enter to save the mask or Escape to clear the current selection. After saving, Pi opens the same prefilled prompt editor described above. The selector attempts to close its browser tab automatically; if the browser blocks script-initiated tab closing, it shows a fallback message instead.
 
 The helper binds only to `127.0.0.1`, writes the mask under `.pi/generated-images/`, and returns its path to Pi. Transparent pixels are the editable region; opaque pixels are preserved.
 
@@ -287,7 +287,7 @@ The `generate_image` tool accepts:
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `prompt` | string | *required* | Description of the image to generate or edit. After a region is selected, this is offered as the suggested prompt; choose it or write a custom prompt |
+| `prompt` | string | *required* | Description of the image to generate or edit. In interactive TUI edits, the prompt editor is prefilled with this value; confirm it or replace it before the request is sent |
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Must be a PNG with an alpha channel and the same dimensions as the input image (transparent = editable). Omit to be asked whether to select interactively |
 | `aspectRatio` | string | configured default, else `1:1` for generation | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. Not sent for edits; edits preserve the input framing and size |
