@@ -52,13 +52,13 @@ In interactive Pi TUI mode, leave `maskPath` out. The extension first asks **“
 - **Edit whole image** — skip the mask and edit the full image.
 - **Cancel** — abort without calling the image API.
 
-After a region is saved, Pi asks whether to use the suggested prompt or write a custom one. Custom prompts start in a blank multi-line editor, so there is nothing to delete. Press Enter to confirm, Shift+Enter for a newline, or Escape to cancel.
+After a region is saved, Pi opens a single editor for the edit prompt. Submit it empty to accept the agent's suggested prompt, or type a custom prompt. Press Enter to confirm, Shift+Enter for a newline, or Escape to cancel.
 
 ```text
 > Edit `/tmp/source.png` into a watercolor illustration while preserving the composition.
 ```
 
-The selected region(s) are converted to a PNG mask automatically and saved under `.pi/generated-images/`. In non-TUI or headless mode, omitting `maskPath` edits the whole image. Pass `maskPath` only when a mask has already been prepared. For edits, the output aspect ratio defaults to the input image's nearest supported ratio unless `aspectRatio` is set explicitly.
+The selected region(s) are converted to a PNG mask automatically and saved under `.pi/generated-images/`. In non-TUI or headless mode, omitting `maskPath` edits the whole image. Pass `maskPath` only when a mask has already been prepared; it must be a PNG with an alpha channel and the same dimensions as the input image (transparent pixels are editable). Edits preserve the source image's framing and resolution, so `aspectRatio` applies only to generation.
 
 The selected model must use the `openai-images` API type for image editing. Google models support text-to-image generation through Gemini's native API.
 
@@ -66,7 +66,7 @@ The selected model must use the `openai-images` API type for image editing. Goog
 
 The interactive edit flow can launch a local browser canvas for freehand lasso selection. It does not depend on Pi's terminal-cell resolution and supports multiple shapes, undo, and clear at source-pixel precision.
 
-Drag to draw a loop around each area; release to close and fill it. Press Enter to save the mask or Escape to clear the current selection. After saving, Pi asks whether to use the suggested prompt or write a custom one. The selector attempts to close its browser tab automatically; if the browser blocks script-initiated tab closing, it shows a fallback message instead.
+Drag to draw a loop around each area; release to close and fill it. Press Enter to save the mask or Escape to clear the current selection. After saving, Pi opens the same prompt editor described above. The selector attempts to close its browser tab automatically; if the browser blocks script-initiated tab closing, it shows a fallback message instead.
 
 The helper binds only to `127.0.0.1`, writes the mask under `.pi/generated-images/`, and returns its path to Pi. Transparent pixels are the editable region; opaque pixels are preserved.
 
@@ -75,9 +75,9 @@ The helper binds only to `127.0.0.1`, writes the mask under `.pi/generated-image
 The local HTTP service starts only when the browser selector is actually launched. It is not started at Pi startup.
 
 - **Start** — `generate_image` spawns `lib/mask-selector.mjs` after you choose the browser mask tool. The helper binds a random port on `127.0.0.1`, creates a per-run token, then opens the browser page.
-- **Stop on save** — after the mask is written, the helper responds, closes the server and all connections, and exits. It then returns to Pi for the prompt choice.
+- **Stop on save** — after the mask is written, the helper responds, closes the server and all connections, and exits. It then returns to Pi for the prompt editor.
 - **Stop on cancel** — the Cancel button sends `/cancel`; closing the tab without saving sends a `pagehide` cancel beacon.
-- **Stop on timeout or abort** — the interactive timeout defaults to 600 seconds; aborting the tool terminates the child process.
+- **Stop on timeout or abort** — browser mask selection is capped at 600 seconds; aborting the tool terminates the child process.
 
 The service only serves the source image and accepts the mask for that single run. It is never a persistent daemon.
 
@@ -157,7 +157,8 @@ Every model is a standard settings entry and can be edited by hand or through JS
           "id": "gemini-4-argon",
           "name": "Gemini 4 Argon",
           "api": "openai-images",
-          "responseFormat": "url",
+          "responseFormat": "b64_json",
+          "sizeMode": "any",
           "supportsEdit": true,
           "defaultAspectRatio": "1:1"
         }
@@ -214,7 +215,8 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) o
           "id": "my-local-image-model",
           "name": "My Local Image Model",
           "cost": 0,
-          "responseFormat": "url",
+          "responseFormat": "b64_json",
+          "sizeMode": "any",
           "supportsEdit": true,
           "defaultAspectRatio": "16:9",
           "defaultImageSize": "1K"
@@ -225,9 +227,38 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) o
 }
 ```
 
-Model entries accept `responseFormat`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize` — the same fields the add/edit wizard writes. `api` can be set per model to override the provider.
+Model entries accept `responseFormat`, `sizeMode`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize`; `api` can be set per model to override the provider. `sizeMode` controls how `aspectRatio` maps to the OpenAI Images `size` field:
 
-For providers whose signed image URLs require server-side authentication, set `responseFormat` to `b64_json`. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request to the provider.
+- `openai` — only `1024x1024`, `1536x1024`, `1024x1536`, matching `api.openai.com`; other ratios are rounded.
+- `any` — exact-ratio dimensions such as `1024x768` (4:3) and `1344x576` (21:9), for servers that accept arbitrary `WxH`.
+
+Custom providers default to `any`; the built-in `openai` provider defaults to `openai`. `responseFormat` defaults to `b64_json`; set it to `url` only when the provider returns URLs the downloader supports. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request.
+
+### gemini-web2api (Gemini Web proxy)
+
+`gemini-web2api` v1.3+ is stricter about the OpenAI Images contract:
+
+- `response_format=url` is rejected; the proxy returns `b64_json` only. The extension defaults to `b64_json`.
+- `size` is applied to the final image. The extension deliberately omits `size` from **edit** requests, because a masked edit is composited back into the source image; sending a size would center-crop or downscale that composite and can trip the proxy's framing gate. Edits keep the input image's framing and resolution. `size` is still sent for generation.
+- Errors use the OpenAI `ErrorResponse` shape. The extension surfaces `type`, `code`, `param`, and `x-request-id` in the error text.
+- The proxy's default `image_request_budget_sec` is 900 seconds; the extension's request timeout defaults to 900 seconds to match.
+
+```json
+{
+  "defaultProvider": "gemini-web2api",
+  "defaultModel": "gemini-4-argon",
+  "providers": {
+    "gemini-web2api": {
+      "baseUrl": "https://your-proxy.example.com/v1",
+      "apiKey": "sk-…",
+      "api": "openai-images",
+      "responseFormat": "b64_json",
+      "sizeMode": "any",
+      "models": [{ "id": "gemini-4-argon" }]
+    }
+  }
+}
+```
 
 
 | Type | Used By | Endpoint |
@@ -258,13 +289,13 @@ The `generate_image` tool accepts:
 |-----------|------|---------|-------------|
 | `prompt` | string | *required* | Description of the image to generate or edit. After a region is selected, this is offered as the suggested prompt; choose it or write a custom prompt |
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
-| `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Omit to be asked whether to select interactively |
-| `aspectRatio` | string | configured default, else `1:1` for generation; input ratio for edits | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9` |
+| `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Must be a PNG with an alpha channel and the same dimensions as the input image (transparent = editable). Omit to be asked whether to select interactively |
+| `aspectRatio` | string | configured default, else `1:1` for generation | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. Not sent for edits; edits preserve the input framing and size |
 | `imageSize` | string | configured default, else `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; the OpenAI Images API has no equivalent and ignores it |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |
-| `timeout` | number | `600` | Generation timeout in seconds |
+| `timeout` | number | `900` | Request timeout in seconds; matches gemini-web2api's default `image_request_budget_sec`. Browser mask selection is capped at 600 seconds |
 
 ## Pi Integration
 

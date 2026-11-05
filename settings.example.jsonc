@@ -31,9 +31,10 @@
   "save": "custom",
   "saveDir": "/path/to/Pictures/pi-generated",
 
-  // Per-request timeout in seconds. Default: 600 (10 minutes).
-  // Slow relay queues routinely need 60-120s; raise it for 4K models.
-  "timeout": 600,
+  // Per-request timeout in seconds. Default: 900 (15 minutes).
+  // gemini-web2api's own image budget defaults to 900s; lower this for
+  // faster failures on a fast relay.
+  "timeout": 900,
 
   // Proxy used only by the curl-based downloader for signed Gemini image
   // URLs. Ordinary OpenAI-compatible CDNs are fetched directly and ignore it.
@@ -48,13 +49,15 @@
       "apiKey": "sk-REPLACE_WITH_YOUR_KEY",    // omit to fall back to Pi's ModelRegistry / env
       "headers": { "User-Agent": "My Relay Client" }, // optional extra request headers
       "api": "openai-images",                  // the only OpenAI-style API type
-      "responseFormat": "b64_json",            // "url" (default) or "b64_json"
+      "responseFormat": "b64_json",            // "b64_json" (default) or "url"
+      "sizeMode": "any",                       // "any" (exact WxH) or "openai" (three sizes)
       "models": [
         {
           "id": "image-model-1",       // sent as the `model` field
           "name": "Image Model 1",     // label in /image-model
           "cost": 0,                   // display only, not used for billing
-          "responseFormat": "url",     // optional per-model override
+          "responseFormat": "b64_json", // optional per-model override
+          "sizeMode": "any",            // optional per-model override
           "supportsEdit": true,        // /images/edits support
           "defaultAspectRatio": "1:1", // used when the tool omits aspectRatio
           "defaultImageSize": "1K"     // used when the tool omits imageSize
@@ -126,6 +129,12 @@
 //   imageSize (1K/2K/4K — Gemini only), quality (auto/low/medium/high —
 //   OpenAI models only), imagePath + maskPath (routes to /images/edits).
 //
+// • `sizeMode` controls how aspectRatio maps to the OpenAI Images `size`:
+//     "openai" → 1024x1024 / 1536x1024 / 1024x1536 (api.openai.com)
+//     "any"    → exact ratios such as 1024x768 (4:3) and 1344x576 (21:9)
+//   Custom relays default to "any"; the `openai` provider defaults to
+//   "openai". gemini-web2api accepts arbitrary WxH and should use "any".
+//
 // • `responseFormat: "b64_json"` is the safe choice for relays: it asks for
 //   the image bytes instead of a URL you may not be able to fetch. Note that
 //   many relays ignore it and inline a data URL anyway — both are handled.
@@ -140,7 +149,8 @@
 //         "id": "gemini-4-argon",
 //         "name": "Gemini 4 Argon",
 //         "api": "openai-images",       // or "google-generative-ai-image"
-//         "responseFormat": "url",       // or "b64_json" (openai-images only)
+//         "responseFormat": "b64_json",  // or "url" (openai-images only)
+//         "sizeMode": "any",              // exact WxH, or "openai"
 //         "supportsEdit": true,          // /images/edits support
 //         "defaultAspectRatio": "1:1",   // used when the tool omits aspectRatio
 //         "defaultImageSize": "1K"       // used when the tool omits imageSize

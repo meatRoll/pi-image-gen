@@ -65,12 +65,19 @@ interface ImageModel {
 const SAVE_MODES = ["project", "global", "custom"] as const;
 type SaveMode = (typeof SAVE_MODES)[number];
 
-const DEFAULT_TIMEOUT_MS = 600_000; // 10 minutes
+const DEFAULT_TIMEOUT_MS = 900_000; // 15 minutes; matches gemini-web2api's default image budget
+const DEFAULT_MASK_TIMEOUT_SEC = 600;
+
+type OpenAIImageSizeMode = "openai" | "any";
 
 /** Image-generation options stored per model in the plugin settings. */
 interface ImageModelOptions {
-  /** OpenAI Images response format. `b64_json` avoids signed media URLs. */
+  /** OpenAI Images response format. Defaults to b64_json. */
   responseFormat?: "url" | "b64_json";
+  /** How aspectRatio maps to the Images `size` field. "openai" keeps the
+   *  three sizes accepted by api.openai.com; "any" uses exact-ratio sizes for
+   *  providers that accept arbitrary WxH (for example gemini-web2api). */
+  sizeMode?: OpenAIImageSizeMode;
   /** Whether the model exposes POST /images/edits (imagePath/maskPath). */
   supportsEdit?: boolean;
   /** Used when the generate_image call omits aspectRatio. */
@@ -87,7 +94,7 @@ interface ExtensionConfig {
   saveDir?: string;
   defaultProvider?: string;
   defaultModel?: string;
-  /** Image generation timeout in seconds. Default: 600 (10 min). */
+  /** Image generation timeout in seconds. Default: 900 (15 min). */
   timeout?: number;
   /** Image provider definitions. Each key is a provider name; value defines
    *  baseUrl, apiKey, headers, api type, and models. Models imported from Pi's
@@ -293,6 +300,7 @@ interface ModelsJsonImageModelDef {
   api?: ImageApi;
   cost?: number;
   responseFormat?: "url" | "b64_json";
+  sizeMode?: OpenAIImageSizeMode;
   supportsEdit?: boolean;
   defaultAspectRatio?: string;
   defaultImageSize?: string;
@@ -304,8 +312,10 @@ interface ModelsJsonImageProviderConfig {
   /** Extra request headers, e.g. a relay's User-Agent. */
   headers?: Record<string, string>;
   api?: ImageApi;
-  /** OpenAI Images response format. Use b64_json when the server owns signed-media authentication. */
+  /** OpenAI Images response format. Defaults to b64_json. */
   responseFormat?: "url" | "b64_json";
+  /** Provider-wide default for how aspectRatio maps to `size`. */
+  sizeMode?: OpenAIImageSizeMode;
   models?: ModelsJsonImageModelDef[];
 }
 
@@ -353,6 +363,7 @@ function getSettingsImageModels(config: ExtensionConfig): ResolvedImageModel[] {
         api: modelDef.api || providerApi,
         cost: modelDef.cost || 0,
         responseFormat: modelDef.responseFormat,
+        sizeMode: modelDef.sizeMode,
         supportsEdit: modelDef.supportsEdit,
         defaultAspectRatio: modelDef.defaultAspectRatio,
         defaultImageSize: modelDef.defaultImageSize,
@@ -492,6 +503,7 @@ interface ProviderConfig {
   headers?: Record<string, string>;
   downloadProxy?: string;
   responseFormat?: "url" | "b64_json";
+  sizeMode?: OpenAIImageSizeMode;
 }
 
 function trimBaseUrl(baseUrl: string): string {
@@ -566,6 +578,9 @@ async function resolveProviderConfig(
     headers,
     downloadProxy: config.downloadProxy,
     responseFormat: imageModel.responseFormat ?? settingsProvider?.responseFormat,
+    sizeMode: imageModel.sizeMode
+      ?? settingsProvider?.sizeMode
+      ?? (imageModel.provider === "openai" ? "openai" : "any"),
   };
 }
 
@@ -574,6 +589,14 @@ async function resolveProviderConfig(
 interface GeneratedImage {
   data: string;       // base64
   mimeType: string;
+  /** Actual output dimensions reported by an OpenAI-compatible Images response. */
+  responseSize?: string;
+  /** Actual output format reported by the provider. */
+  outputFormat?: string;
+  /** Provider usage estimate, when returned. */
+  usage?: Record<string, unknown>;
+  /** x-request-id for support/diagnostics. */
+  requestId?: string;
 }
 
 interface InputImage {
@@ -637,6 +660,73 @@ function inputImageDimensions(inputImage: InputImage): { widthPx: number; height
     throw new Error(`Cannot determine dimensions for "${inputImage.filename}".`);
   }
   return dimensions;
+}
+
+const MAX_EDIT_IMAGE_BYTES = 50 * 1024 * 1024;
+const MAX_EDIT_MASK_BYTES = 4 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+interface PngHeaderInfo {
+  width: number;
+  height: number;
+  hasAlpha: boolean;
+}
+
+/** Read the PNG header fields the edit API validates without decoding pixels. */
+function readPngHeaderInfo(data: Buffer): PngHeaderInfo | undefined {
+  if (data.length < 33 || !data.subarray(0, 8).equals(PNG_SIGNATURE)) return undefined;
+  if (data.subarray(12, 16).toString("ascii") !== "IHDR") return undefined;
+  const width = data.readUInt32BE(16);
+  const height = data.readUInt32BE(20);
+  const bitDepth = data[24];
+  const colorType = data[25];
+  if (!width || !height) return undefined;
+  if (![1, 2, 4, 8, 16].includes(bitDepth) || ![0, 2, 3, 4, 6].includes(colorType)) return undefined;
+
+  let hasAlpha = colorType === 4 || colorType === 6;
+  let hasIend = false;
+  let offset = 8;
+  while (offset + 12 <= data.length) {
+    const length = data.readUInt32BE(offset);
+    const type = data.subarray(offset + 4, offset + 8).toString("ascii");
+    if (type === "tRNS") hasAlpha = true;
+    if (type === "IEND") {
+      hasIend = true;
+      break;
+    }
+    offset += 12 + length;
+  }
+  if (!hasIend) return undefined;
+  return { width, height, hasAlpha };
+}
+
+/**
+ * Mirror the edit endpoint's input contract before uploading so a bad mask
+ * fails locally instead of after a multipart round trip.
+ */
+function validateEditInputs(inputImage: InputImage, maskImage?: InputImage): void {
+  if (inputImage.data.length > MAX_EDIT_IMAGE_BYTES) {
+    throw new Error(`Input image "${inputImage.filename}" exceeds the 50 MiB edit limit.`);
+  }
+  if (!maskImage) return;
+
+  if (maskImage.data.length > MAX_EDIT_MASK_BYTES) {
+    throw new Error(`Mask "${maskImage.filename}" exceeds the 4 MiB edit limit.`);
+  }
+  const mask = readPngHeaderInfo(maskImage.data);
+  if (!mask) {
+    throw new Error(`Mask "${maskImage.filename}" must be a PNG image.`);
+  }
+  if (!mask.hasAlpha) {
+    throw new Error(`Mask "${maskImage.filename}" must contain an alpha channel.`);
+  }
+  const source = inputImageDimensions(inputImage);
+  if (mask.width !== source.widthPx || mask.height !== source.heightPx) {
+    throw new Error(
+      `Mask dimensions must match the input image (${source.widthPx}x${source.heightPx}); ` +
+      `"${maskImage.filename}" is ${mask.width}x${mask.height}.`,
+    );
+  }
 }
 
 async function nextMaskPath(cwd: string, config: ExtensionConfig): Promise<string> {
@@ -707,14 +797,17 @@ async function prepareImageForTui(image: GeneratedImage): Promise<GeneratedImage
     );
     if (!resized) return image;
     const png = await convertToPng(resized.data, resized.mimeType);
-    return png || { data: resized.data, mimeType: resized.mimeType };
+    return png
+      ? { ...image, data: png.data, mimeType: png.mimeType }
+      : { ...image, data: resized.data, mimeType: resized.mimeType };
   } catch {
     // Keep the original provider result available if local image processing fails.
     return image;
   }
 }
 
-// OpenAI size mapping from aspect ratios
+// api.openai.com only accepts these sizes. Other ratios are rounded to the
+// closest supported size, which is why 4:3 becomes 3:2 here.
 const OPENAI_SIZES: Record<string, string> = {
   "1:1": "1024x1024",
   "16:9": "1536x1024",
@@ -724,6 +817,27 @@ const OPENAI_SIZES: Record<string, string> = {
   "3:2": "1536x1024",
   "2:3": "1024x1536",
 };
+
+// Proxies such as gemini-web2api accept arbitrary WxH (multiples of 16, ratio
+// 1:3..3:1) and apply the exact size. Exact-ratio dimensions keep 4:3 from
+// silently becoming 3:2. 21:9 is 1344x576, i.e. 7:3 in lowest terms.
+const EXACT_SIZES: Record<string, string> = {
+  "1:1": "1024x1024",
+  "16:9": "1536x864",
+  "9:16": "864x1536",
+  "4:3": "1024x768",
+  "3:4": "768x1024",
+  "3:2": "1536x1024",
+  "2:3": "1024x1536",
+  "5:4": "1280x1024",
+  "4:5": "1024x1280",
+  "21:9": "1344x576",
+};
+
+function openAISizeFor(aspectRatio: string, mode: OpenAIImageSizeMode | undefined): string {
+  const sizes = mode === "openai" ? OPENAI_SIZES : EXACT_SIZES;
+  return sizes[aspectRatio] || sizes["1:1"];
+}
 
 /** Pick the supported ratio closest to the source image when editing. */
 function closestAspectRatio(inputImage: InputImage): string {
@@ -931,6 +1045,74 @@ async function downloadImageUrl(
   }
 }
 
+function summarizeErrorBody(body: string, limit = 400): string {
+  const text = body
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const flat = text || body.replace(/\s+/g, " ").trim();
+  if (flat.length <= limit) return flat;
+  return `${flat.slice(0, limit)}... [${flat.length} chars truncated]`;
+}
+
+interface OpenAIErrorDetails {
+  status: number;
+  message: string;
+  type?: string;
+  param?: string | null;
+  code?: string | null;
+  retryable?: boolean;
+  requestId?: string;
+}
+
+class OpenAIRequestError extends Error {
+  readonly info: OpenAIErrorDetails;
+
+  constructor(operation: string, info: OpenAIErrorDetails) {
+    const context = [
+      info.code ? `code=${info.code}` : undefined,
+      info.param ? `param=${info.param}` : undefined,
+      info.requestId ? `request=${info.requestId}` : undefined,
+    ].filter(Boolean).join(", ");
+    super(`OpenAI ${operation} failed (${info.status}${context ? ` ${context}` : ""}): ${info.message}`);
+    this.name = "OpenAIRequestError";
+    this.info = info;
+  }
+}
+
+/** Parse the OpenAI ErrorResponse shape used by current gemini-web2api releases. */
+function parseOpenAIErrorBody(body: string, status: number, requestId?: string): OpenAIErrorDetails {
+  const fallback = summarizeErrorBody(body) || `HTTP ${status}`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return { status, message: fallback, requestId };
+  }
+  const candidate = (parsed as { error?: unknown } | null)?.error;
+  if (typeof candidate === "string") {
+    return { status, message: candidate, requestId };
+  }
+  if (candidate && typeof candidate === "object") {
+    const record = candidate as Record<string, unknown>;
+    return {
+      status,
+      message: typeof record.message === "string" && record.message.trim()
+        ? record.message
+        : fallback,
+      type: typeof record.type === "string" ? record.type : undefined,
+      param: typeof record.param === "string" ? record.param : null,
+      code: typeof record.code === "string" ? record.code : null,
+      retryable: typeof record.retryable === "boolean" ? record.retryable : undefined,
+      requestId,
+    };
+  }
+  return { status, message: fallback, requestId };
+}
+
 /** OpenAI /v1/images/generations and /v1/images/edits endpoints */
 async function generateViaOpenAIImages(
   config: ProviderConfig,
@@ -942,9 +1124,12 @@ async function generateViaOpenAIImages(
   maskImage?: InputImage,
   signal?: AbortSignal,
 ): Promise<GeneratedImage> {
-  const size = OPENAI_SIZES[aspectRatio] || "1024x1024";
   const operation = inputImage ? "image edit" : "image generation";
   const endpoint = inputImage ? "edits" : "generations";
+  // Do not send size for edits: gemini-web2api v1.3 applies it to the final
+  // composited image, which either center-crops a masked result or trips its
+  // framing gate. Omitting size preserves the source dimensions and framing.
+  const responseFormat = config.responseFormat || "b64_json";
   const headers: Record<string, string> = {
     ...(config.apiKey ? { Authorization: `Bearer ${config.apiKey}` } : {}),
     ...config.headers,
@@ -956,8 +1141,7 @@ async function generateViaOpenAIImages(
     form.append("model", model.id);
     form.append("prompt", prompt);
     form.append("n", "1");
-    form.append("size", size);
-    if (!isGptImageModel(model.id)) form.append("response_format", config.responseFormat || "url");
+    if (!isGptImageModel(model.id)) form.append("response_format", responseFormat);
     if (isGptImageModel(model.id)) form.append("quality", quality);
     if (model.id === "dall-e-3") form.append("quality", quality === "high" ? "hd" : "standard");
     form.append("image", imageBlob(inputImage), inputImage.filename);
@@ -970,9 +1154,9 @@ async function generateViaOpenAIImages(
       model: model.id,
       prompt,
       n: 1,
-      size,
+      size: openAISizeFor(aspectRatio, config.sizeMode),
     };
-    if (!isGptImageModel(model.id)) body.response_format = config.responseFormat || "url";
+    if (!isGptImageModel(model.id)) body.response_format = responseFormat;
     if (isGptImageModel(model.id)) body.quality = quality;
     if (model.id === "dall-e-3") body.quality = quality === "high" ? "hd" : "standard";
     headers["Content-Type"] = "application/json";
@@ -985,14 +1169,27 @@ async function generateViaOpenAIImages(
     body: requestBody,
     signal,
   });
+  const requestId = response.headers.get("x-request-id") || undefined;
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`OpenAI ${operation} failed (${response.status}): ${errorText}`);
+    throw new OpenAIRequestError(
+      operation,
+      parseOpenAIErrorBody(errorText, response.status, requestId),
+    );
   }
 
   const result = (await response.json()) as {
     data?: Array<{ b64_json?: string; url?: string; media_type?: string }>;
+    size?: string;
+    output_format?: string;
+    usage?: Record<string, unknown>;
+  };
+  const metadata = {
+    responseSize: typeof result.size === "string" ? result.size : undefined,
+    outputFormat: typeof result.output_format === "string" ? result.output_format : undefined,
+    usage: result.usage,
+    requestId,
   };
   const image = result.data?.[0];
   if (image?.b64_json) {
@@ -1000,12 +1197,14 @@ async function generateViaOpenAIImages(
     return {
       data: image.b64_json,
       mimeType: image.media_type?.split(";", 1)[0] || sniffImageMime(bytes) || "image/png",
+      ...metadata,
     };
   }
   if (image?.url) {
     // Standard behaviour: honour the URL as given. Relays usually hand back a
     // server-owned data URL; anything else is just fetched.
-    return downloadImageUrl(image.url, { signal, downloadProxy: config.downloadProxy });
+    const downloaded = await downloadImageUrl(image.url, { signal, downloadProxy: config.downloadProxy });
+    return { ...downloaded, ...metadata };
   }
   throw new Error(`OpenAI ${operation} returned no image data`);
 }
@@ -1197,10 +1396,10 @@ const TOOL_PARAMS = Type.Object({
     description: "Local path (or file:// URL) of an input image for image-to-image editing. Requires an openai-images model. In interactive TUI mode, omit maskPath and the tool will ask whether to launch a region selector first.",
   })),
   maskPath: Type.Optional(Type.String({
-    description: "Optional prepared mask image for local editing. Requires imagePath. Omit this to be asked whether to select an area interactively.",
+    description: "Optional prepared mask image for local editing. Requires imagePath. Must be a PNG with an alpha channel and the same dimensions as the input image; transparent pixels are editable. Omit this to be asked whether to select an area interactively.",
   })),
   aspectRatio: Type.Optional(Type.String({
-    description: "Aspect ratio: 1:1 (default for generation), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. Uses the model's saved default when omitted. For edits, defaults to the input image's nearest supported ratio.",
+    description: "Aspect ratio for generation: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. Uses the model's saved default when omitted. Edits preserve the input image's framing and size, so aspectRatio is not sent for edits.",
   })),
   imageSize: Type.Optional(Type.String({
     description: "Image resolution: 1K (1024x1024, default), 2K, 4K. Uses the model's saved default when omitted. Provider-dependent.",
@@ -1215,7 +1414,7 @@ const TOOL_PARAMS = Type.Object({
     description: "Directory to save image when save=custom.",
   })),
   timeout: Type.Optional(Type.Number({
-    description: "Generation timeout in seconds. Default: 600 (10 min).",
+    description: "Request timeout in seconds. Default: 900 (15 min), matching gemini-web2api's default image budget. Browser mask selection is capped at 600s.",
   })),
 });
 
@@ -2305,7 +2504,7 @@ async function askImageOptions(
     return {
       api: inferredApi,
       ...(inferredApi === "openai-images"
-        ? { responseFormat: context.existing?.responseFormat ?? "url", supportsEdit: context.existing?.supportsEdit ?? true }
+        ? { responseFormat: context.existing?.responseFormat ?? "b64_json", supportsEdit: context.existing?.supportsEdit ?? true }
         : {}),
       ...(context.existing?.defaultAspectRatio ? { defaultAspectRatio: context.existing.defaultAspectRatio } : {}),
       ...(context.existing?.defaultImageSize ? { defaultImageSize: context.existing.defaultImageSize } : {}),
@@ -2329,7 +2528,7 @@ async function askImageOptions(
   });
   if (api === undefined) return undefined;
 
-  let responseFormat: "url" | "b64_json" = context.existing?.responseFormat ?? "url";
+  let responseFormat: "url" | "b64_json" = context.existing?.responseFormat ?? "b64_json";
   let supportsEdit = context.existing?.supportsEdit ?? true;
   const partial = (): ImageModelSetup => ({
     api,
@@ -2477,7 +2676,7 @@ function modelEntryFrom(
   else if (typeof next.name !== "string") next.name = modelId;
 
   if (options.api === "openai-images") {
-    next.responseFormat = options.responseFormat ?? "url";
+    next.responseFormat = options.responseFormat ?? "b64_json";
     next.supportsEdit = options.supportsEdit ?? true;
   } else {
     delete next.responseFormat;
@@ -2584,6 +2783,9 @@ function validateSettingsObject(value: unknown): asserts value is Record<string,
       if (providerValue.headers !== undefined && !isStringRecord(providerValue.headers)) {
         throw new Error(`providers.${provider}.headers must be an object of string values`);
       }
+      if (providerValue.sizeMode !== undefined && providerValue.sizeMode !== "openai" && providerValue.sizeMode !== "any") {
+        throw new Error(`providers.${provider}.sizeMode must be openai or any`);
+      }
       if (providerValue.models !== undefined) {
         if (!Array.isArray(providerValue.models)) throw new Error(`providers.${provider}.models must be an array`);
         for (const modelValue of providerValue.models) {
@@ -2596,6 +2798,9 @@ function validateSettingsObject(value: unknown): asserts value is Record<string,
           }
           if (modelValue.responseFormat !== undefined && modelValue.responseFormat !== "url" && modelValue.responseFormat !== "b64_json") {
             throw new Error(`providers.${provider}.models[].responseFormat must be url or b64_json`);
+          }
+          if (modelValue.sizeMode !== undefined && modelValue.sizeMode !== "openai" && modelValue.sizeMode !== "any") {
+            throw new Error(`providers.${provider}.models[].sizeMode must be openai or any`);
           }
           if (modelValue.supportsEdit !== undefined && typeof modelValue.supportsEdit !== "boolean") {
             throw new Error(`providers.${provider}.models[].supportsEdit must be a boolean`);
@@ -2925,7 +3130,7 @@ async function editFlow(
       : item.catalogModel?.api ?? "openai-images",
     responseFormat: original.responseFormat === "b64_json" || original.responseFormat === "url"
       ? original.responseFormat
-      : item.catalogModel?.responseFormat ?? "url",
+      : item.catalogModel?.responseFormat ?? "b64_json",
     supportsEdit: typeof original.supportsEdit === "boolean" ? original.supportsEdit : item.catalogModel?.supportsEdit ?? true,
     defaultAspectRatio: typeof original.defaultAspectRatio === "string" ? original.defaultAspectRatio : item.catalogModel?.defaultAspectRatio,
     defaultImageSize: typeof original.defaultImageSize === "string" ? original.defaultImageSize : item.catalogModel?.defaultImageSize,
@@ -2985,7 +3190,7 @@ async function editFlow(
   };
 
   while (true) {
-    const responseFormatLabel = options.api === "openai-images" ? options.responseFormat ?? "url" : "n/a";
+    const responseFormatLabel = options.api === "openai-images" ? options.responseFormat ?? "b64_json" : "n/a";
     const fields: SelectOption<string>[] = [
       { label: `Name: ${modelName}`, value: "name" },
       { label: `Model ID: ${modelId}`, value: "id" },
@@ -3099,7 +3304,7 @@ async function editFlow(
             { label: "url — server returns an image link (or data URL)", value: "url" },
             { label: "b64_json — server returns image bytes", value: "b64_json" },
           ],
-          current: options.responseFormat ?? "url",
+          current: options.responseFormat ?? "b64_json",
           ai: {
             kind: "responseFormat",
             field: "responseFormat",
@@ -3590,7 +3795,7 @@ export default function piImageGen(pi: ExtensionAPI) {
     label: "Generate image",
     description:
       "Generate an image from a text prompt, or edit a local input image when imagePath is supplied. Uses the selected image model, which is independent of Pi's current text model. " +
-      "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. After a mask is selected, the user chooses to use the suggested prompt or write a custom one from a blank editor. " +
+      "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. After a mask is selected, a single editor asks for the edit prompt: typing text uses it, and submitting the empty editor accepts the prompt suggested here. Edits preserve the input image's framing and resolution. " +
       "Pass maskPath only when a mask was already prepared. Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
     parameters: TOOL_PARAMS,
 
@@ -3625,6 +3830,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       const inputImage = inputPath
         ? await loadInputImage(inputPath, ctx.cwd, "input image")
         : undefined;
+      const inputDimensions = inputImage ? inputImageDimensions(inputImage) : undefined;
       if (inputImage && !params.aspectRatio && !imageModel.defaultAspectRatio) {
         aspectRatio = closestAspectRatio(inputImage);
       }
@@ -3634,6 +3840,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       let generatedMaskPath: string | undefined;
       let editScope: "provided" | "region" | "whole" | "none" = params.maskPath ? "provided" : "none";
       let editFallback: string | undefined;
+      let editNotice: string | undefined;
       let maskSource: "provided" | "browser" | undefined = params.maskPath ? "provided" : undefined;
       const canceledEdit = (message = "Image edit canceled: no edit area was selected."): AgentToolResult<unknown> => ({
         content: [{ type: "text", text: message }],
@@ -3658,7 +3865,10 @@ export default function piImageGen(pi: ExtensionAPI) {
               inputPath,
               ctx.cwd,
               config,
-              params.timeout ?? config.timeout ?? DEFAULT_TIMEOUT_MS / 1000,
+              Math.min(
+                params.timeout ?? config.timeout ?? DEFAULT_MASK_TIMEOUT_SEC,
+                DEFAULT_MASK_TIMEOUT_SEC,
+              ),
               signal,
             );
             if (selectedMask === "canceled") return canceledEdit();
@@ -3675,49 +3885,43 @@ export default function piImageGen(pi: ExtensionAPI) {
         }
       }
 
-      // After the user has drawn a mask, let them either accept the agent's
-      // suggested prompt or start from a blank editor. Never prefill the custom
-      // editor: clearing a long suggestion should not be part of the flow.
+      if (inputImage && params.aspectRatio) {
+        editNotice = "Edits preserve the source image framing and size; aspectRatio applies to generation only.";
+      }
+      if (inputImage) validateEditInputs(inputImage, maskImage);
+
+      // After the user has drawn a mask, ask for the prompt in a single editor.
+      // The earlier select dialog could confirm the first option on Enter while
+      // ignoring typed text; an empty submission still accepts the agent's
+      // suggestion, and leaving the editor blank is never required.
+      let promptSource: "toolCall" | "suggested" | "custom" = "toolCall";
       if (editScope === "region" && generatedMaskPath) {
         const suggestedPrompt = params.prompt.trim();
-        const askForCustomPrompt = async (): Promise<string | undefined> => {
-          const title = "Write a custom prompt for the selected area";
-          let editedPrompt = await ctx.ui.editor(title, "");
-          while (editedPrompt !== undefined && !editedPrompt.trim()) {
-            ctx.ui.notify("Edit prompt cannot be empty.", "warning");
-            editedPrompt = await ctx.ui.editor(title, "");
-          }
-          return editedPrompt?.trim();
+        const title = suggestedPrompt
+          ? "Prompt for the selected area (empty = use the agent's suggestion)"
+          : "Prompt for the selected area";
+        const readPrompt = async (): Promise<string | undefined> => {
+          const entered = await ctx.ui.editor(title, "");
+          return entered === undefined ? undefined : entered.trim();
         };
 
-        if (suggestedPrompt) {
-          const preview = suggestedPrompt.replace(/\s+/g, " ").trim();
-          const previewLabel = preview.length > 90 ? `${preview.slice(0, 87)}...` : preview;
-          const useSuggested = `Use suggested prompt — ${previewLabel}`;
-          const writeCustom = "Write a custom prompt";
-          const cancelPrompt = "Cancel";
-          const promptChoice = await ctx.ui.select(
-            "Edit prompt for the selected area",
-            [useSuggested, writeCustom, cancelPrompt],
-          );
-          if (!promptChoice || promptChoice === cancelPrompt) {
-            return canceledEdit("Image edit canceled: prompt entry was canceled.");
-          }
-          if (promptChoice === writeCustom) {
-            const customPrompt = await askForCustomPrompt();
-            if (customPrompt === undefined) {
-              return canceledEdit("Image edit canceled: prompt entry was canceled.");
-            }
-            prompt = customPrompt;
-          } else {
-            prompt = suggestedPrompt;
-          }
-        } else {
-          const customPrompt = await askForCustomPrompt();
+        let customPrompt = await readPrompt();
+        if (customPrompt === undefined) {
+          return canceledEdit("Image edit canceled: prompt entry was canceled.");
+        }
+        while (!customPrompt && !suggestedPrompt) {
+          ctx.ui.notify("Edit prompt cannot be empty.", "warning");
+          customPrompt = await readPrompt();
           if (customPrompt === undefined) {
             return canceledEdit("Image edit canceled: prompt entry was canceled.");
           }
+        }
+        if (customPrompt) {
           prompt = customPrompt;
+          promptSource = "custom";
+        } else {
+          prompt = suggestedPrompt;
+          promptSource = "suggested";
         }
       }
 
@@ -3736,9 +3940,15 @@ export default function piImageGen(pi: ExtensionAPI) {
         ? AbortSignal.any([signal, timeoutSignal])
         : timeoutSignal;
 
+      // Echo the prompt that will actually be sent: the tool-call block in the
+      // TUI only shows the arguments the model passed, so a prompt collected
+      // from the editor is otherwise invisible.
+      const promptPreview = prompt.replace(/\s+/g, " ").trim();
+      const promptLabel = promptPreview.length > 80 ? `${promptPreview.slice(0, 77)}...` : promptPreview;
+
       onUpdate?.({
-        content: [{ type: "text", text: `${action} with ${imageModel.provider}/${imageModel.id}...` }],
-        details: { provider: imageModel.provider, model: imageModel.id, api: imageModel.api },
+        content: [{ type: "text", text: `${action} with ${imageModel.provider}/${imageModel.id}${promptLabel ? ` — prompt: ${promptLabel}` : ""}` }],
+        details: { provider: imageModel.provider, model: imageModel.id, api: imageModel.api, prompt, promptSource },
       });
 
       const providerConfig = await resolveProviderConfig(imageModel, ctx, config);
@@ -3770,8 +3980,13 @@ export default function piImageGen(pi: ExtensionAPI) {
       const downloadUrl = savedPath ? pathToFileURL(savedPath).href : undefined;
       const summary: string[] = [
         `${inputImage ? "Edited" : "Generated"} image with ${imageModel.provider}/${imageModel.id} (${imageModel.api}).`,
-        `Aspect ratio: ${aspectRatio}.`,
       ];
+      if (!inputImage) summary.push(`Aspect ratio: ${aspectRatio}.`);
+      if (inputDimensions) {
+        summary.push(`Input size: ${inputDimensions.widthPx}x${inputDimensions.heightPx}.`);
+      }
+      if (image.responseSize) summary.push(`Output size: ${image.responseSize}.`);
+      if (image.outputFormat) summary.push(`Output format: ${image.outputFormat}.`);
       if (inputImage) summary.push(`Input image: ${inputImage.filename}.`);
       if (maskSource === "browser") {
         summary.push("Edit area: browser-selected mask.");
@@ -3780,8 +3995,11 @@ export default function piImageGen(pi: ExtensionAPI) {
       } else if (params.maskPath) {
         summary.push(`Mask: ${params.maskPath}.`);
       }
-      if (editScope === "region") summary.push(`Edit prompt: ${prompt}`);
+      if (editScope === "region") {
+        summary.push(`Edit prompt${promptSource === "suggested" ? " (agent suggestion)" : ""}: ${prompt}`);
+      }
       if (generatedMaskPath) summary.push(`Generated mask: ${generatedMaskPath}.`);
+      if (editNotice) summary.push(editNotice);
       if (editFallback) summary.push(editFallback);
       if (savedPath) {
         summary.push(`Saved locally to: ${savedPath}`);
@@ -3799,14 +4017,22 @@ export default function piImageGen(pi: ExtensionAPI) {
           model: imageModel.id,
           api: imageModel.api,
           operation: inputImage ? "edit" : "generate",
-          aspectRatio,
+          aspectRatio: inputImage ? undefined : aspectRatio,
+          requestedAspectRatio: params.aspectRatio,
+          inputSize: inputDimensions ? `${inputDimensions.widthPx}x${inputDimensions.heightPx}` : undefined,
+          responseSize: image.responseSize,
+          outputFormat: image.outputFormat,
+          requestId: image.requestId,
+          usage: image.usage,
           quality,
           imagePath: params.imagePath,
           maskPath: generatedMaskPath ?? params.maskPath,
           maskSource,
           editScope: inputImage ? editScope : undefined,
           prompt,
-          promptEdited: prompt !== params.prompt,
+          promptSource,
+          promptEdited: promptSource === "custom",
+          editNotice,
           fallbackReason: editFallback,
           savedPath,
           downloadUrl,
