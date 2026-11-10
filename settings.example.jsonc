@@ -60,7 +60,8 @@
           "sizeMode": "any",            // optional per-model override
           "supportsEdit": true,        // /images/edits support
           "defaultAspectRatio": "1:1", // used when the tool omits aspectRatio
-          "defaultImageSize": "1K"     // used when the tool omits imageSize
+          "defaultImageSize": "1K"     // tier when the tool omits imageSize
+                                       // (Gemini, or sizeMode "any" scaling)
         },
         {
           "id": "image-model-2",
@@ -126,12 +127,18 @@
 //
 // • Tool parameters override settings per call: save, saveDir, timeout,
 //   aspectRatio (1:1, 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9),
-//   imageSize (1K/2K/4K — Gemini only), quality (auto/low/medium/high —
-//   OpenAI models only), imagePath + maskPath (routes to /images/edits).
+//   imageSize (1K/2K/4K — Gemini tiers, and 1x/2x/4x scaling on relays),
+//   size (exact WIDTHxHEIGHT, sizeMode "any" only, overrides aspectRatio),
+//   quality (auto/low/medium/high — OpenAI models only),
+//   imagePath + maskPath (routes to /images/edits).
 //
 // • `sizeMode` controls how aspectRatio maps to the OpenAI Images `size`:
-//     "openai" → 1024x1024 / 1536x1024 / 1024x1536 (api.openai.com)
-//     "any"    → exact ratios such as 1024x768 (4:3) and 1344x576 (21:9)
+//     "openai" → 1024x1024 / 1536x1024 / 1024x1536 (api.openai.com);
+//                other ratios are rounded and imageSize is ignored.
+//     "any"    → exact ratios such as 1024x768 (4:3) and 1344x576 (21:9),
+//                scaled 1x/2x/4x by imageSize and clamped to the relay limits
+//                (multiples of 16, long side ≤ 3840px, short side ≤ 2160px):
+//                4:3 is 2048x1536 at 2K and 2880x2160 at 4K.
 //   Custom relays default to "any"; the `openai` provider defaults to
 //   "openai". gemini-web2api accepts arbitrary WxH and should use "any".
 //
@@ -153,7 +160,7 @@
 //         "sizeMode": "any",              // exact WxH, or "openai"
 //         "supportsEdit": true,          // /images/edits support
 //         "defaultAspectRatio": "1:1",   // used when the tool omits aspectRatio
-//         "defaultImageSize": "1K"       // used when the tool omits imageSize
+//         "defaultImageSize": "1K"       // tier when the tool omits imageSize
 //       }
 //     ]
 //

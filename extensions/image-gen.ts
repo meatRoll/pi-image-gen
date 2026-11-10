@@ -819,8 +819,10 @@ const OPENAI_SIZES: Record<string, string> = {
 };
 
 // Proxies such as gemini-web2api accept arbitrary WxH (multiples of 16, ratio
-// 1:3..3:1) and apply the exact size. Exact-ratio dimensions keep 4:3 from
-// silently becoming 3:2. 21:9 is 1344x576, i.e. 7:3 in lowest terms.
+// 1:3..3:1, long side <= 3840, short side <= 2160) and resize-crop the result
+// to exactly that size. These are the 1K baselines; imageSize scales them.
+// Exact-ratio dimensions keep 4:3 from silently becoming 3:2. 21:9 is
+// 1344x576, i.e. 7:3 in lowest terms.
 const EXACT_SIZES: Record<string, string> = {
   "1:1": "1024x1024",
   "16:9": "1536x864",
@@ -834,9 +836,85 @@ const EXACT_SIZES: Record<string, string> = {
   "21:9": "1344x576",
 };
 
-function openAISizeFor(aspectRatio: string, mode: OpenAIImageSizeMode | undefined): string {
-  const sizes = mode === "openai" ? OPENAI_SIZES : EXACT_SIZES;
-  return sizes[aspectRatio] || sizes["1:1"];
+// Limits enforced by exact-size relays (gemini-web2api's _parse_size).
+const EXACT_SIZE_STEP = 16;
+const EXACT_SIZE_MAX_LONG = 3840;
+const EXACT_SIZE_MAX_SHORT = 2160;
+const EXACT_SIZE_PATTERN = /^(\d{1,5})\s*[x×*]\s*(\d{1,5})$/i;
+const EXACT_SIZE_SCALE: Record<string, number> = { "1K": 1, "2K": 2, "4K": 4 };
+
+/** Snap a dimension onto the pixel grid the relay requires, never below 16. */
+function snapToSizeGrid(value: number): number {
+  return Math.max(EXACT_SIZE_STEP, Math.round(value / EXACT_SIZE_STEP) * EXACT_SIZE_STEP);
+}
+
+/** Clamp a WxH into the range exact-size relays accept, keeping the ratio. */
+function fitExactSize(width: number, height: number): string {
+  const limit = Math.min(
+    1,
+    EXACT_SIZE_MAX_LONG / Math.max(width, height),
+    EXACT_SIZE_MAX_SHORT / Math.min(width, height),
+  );
+  let fittedWidth = snapToSizeGrid(width * limit);
+  let fittedHeight = snapToSizeGrid(height * limit);
+  // Snapping can round back over a limit; step the offending edge down once.
+  if (Math.max(fittedWidth, fittedHeight) > EXACT_SIZE_MAX_LONG) {
+    if (fittedWidth >= fittedHeight) fittedWidth -= EXACT_SIZE_STEP;
+    else fittedHeight -= EXACT_SIZE_STEP;
+  }
+  if (Math.min(fittedWidth, fittedHeight) > EXACT_SIZE_MAX_SHORT) {
+    if (fittedWidth <= fittedHeight) fittedWidth -= EXACT_SIZE_STEP;
+    else fittedHeight -= EXACT_SIZE_STEP;
+  }
+  return `${fittedWidth}x${fittedHeight}`;
+}
+
+/** Apply an imageSize tier (1K/2K/4K) to a ratio's exact baseline size. */
+function scaleExactSize(size: string, imageSize: string | undefined): string {
+  const [width, height] = size.split("x").map(Number);
+  const factor = EXACT_SIZE_SCALE[(imageSize || "1K").toUpperCase()] ?? 1;
+  return fitExactSize(width * factor, height * factor);
+}
+
+/** Validate a caller-supplied WxH against the same limits the relay enforces. */
+function normalizeRequestedSize(value: string): string {
+  const asked = value.trim();
+  const match = EXACT_SIZE_PATTERN.exec(asked);
+  if (!match) {
+    throw new Error(
+      `size must be WIDTHxHEIGHT, for example 1536x640 (got "${asked}").`,
+    );
+  }
+  const width = Number(match[1]);
+  const height = Number(match[2]);
+  if (width < EXACT_SIZE_STEP || height < EXACT_SIZE_STEP) {
+    throw new Error(`size width and height must be at least ${EXACT_SIZE_STEP}px (got ${asked}).`);
+  }
+  if (width % EXACT_SIZE_STEP || height % EXACT_SIZE_STEP) {
+    throw new Error(
+      `size width and height must be multiples of ${EXACT_SIZE_STEP} (got ${asked}); ` +
+      `try ${snapToSizeGrid(width)}x${snapToSizeGrid(height)}.`,
+    );
+  }
+  if (width / height < 1 / 3 || width / height > 3) {
+    throw new Error(`size aspect ratio must be between 1:3 and 3:1 (got ${width}x${height}).`);
+  }
+  if (Math.max(width, height) > EXACT_SIZE_MAX_LONG || Math.min(width, height) > EXACT_SIZE_MAX_SHORT) {
+    throw new Error(
+      `size ${width}x${height} is too large; the long side may be at most ${EXACT_SIZE_MAX_LONG}px ` +
+      `and the short side at most ${EXACT_SIZE_MAX_SHORT}px.`,
+    );
+  }
+  return `${width}x${height}`;
+}
+
+function openAISizeFor(
+  aspectRatio: string,
+  mode: OpenAIImageSizeMode | undefined,
+  imageSize?: string,
+): string {
+  if (mode === "openai") return OPENAI_SIZES[aspectRatio] || OPENAI_SIZES["1:1"];
+  return scaleExactSize(EXACT_SIZES[aspectRatio] || EXACT_SIZES["1:1"], imageSize);
 }
 
 /** Pick the supported ratio closest to the source image when editing. */
@@ -1119,7 +1197,9 @@ async function generateViaOpenAIImages(
   model: ImageModel,
   prompt: string,
   aspectRatio: string,
+  imageSize: string,
   quality: string,
+  exactSize?: string,
   inputImage?: InputImage,
   maskImage?: InputImage,
   signal?: AbortSignal,
@@ -1154,7 +1234,7 @@ async function generateViaOpenAIImages(
       model: model.id,
       prompt,
       n: 1,
-      size: openAISizeFor(aspectRatio, config.sizeMode),
+      size: exactSize ?? openAISizeFor(aspectRatio, config.sizeMode, imageSize),
     };
     if (!isGptImageModel(model.id)) body.response_format = responseFormat;
     if (isGptImageModel(model.id)) body.quality = quality;
@@ -1327,6 +1407,7 @@ async function generateImage(
   aspectRatio: string,
   imageSize: string,
   quality: string,
+  exactSize?: string,
   inputImage?: InputImage,
   maskImage?: InputImage,
   signal?: AbortSignal,
@@ -1339,7 +1420,7 @@ async function generateImage(
 
   switch (model.api) {
     case "openai-images":
-      return generateViaOpenAIImages(config, model, prompt, aspectRatio, quality, inputImage, maskImage, signal);
+      return generateViaOpenAIImages(config, model, prompt, aspectRatio, imageSize, quality, exactSize, inputImage, maskImage, signal);
     case "google-generative-ai-image":
       return generateViaGoogleImage(config, model, prompt, aspectRatio, imageSize, signal);
     default:
@@ -1399,10 +1480,13 @@ const TOOL_PARAMS = Type.Object({
     description: "Optional prepared mask image for local editing. Requires imagePath. Must be a PNG with an alpha channel and the same dimensions as the input image; transparent pixels are editable. Omit this to be asked whether to select an area interactively.",
   })),
   aspectRatio: Type.Optional(Type.String({
-    description: "Aspect ratio for generation: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. Uses the model's saved default when omitted. Edits preserve the input image's framing and size, so aspectRatio is not sent for edits.",
+    description: "Aspect ratio for generation: 1:1 (default), 2:3, 3:2, 3:4, 4:3, 4:5, 5:4, 9:16, 16:9, 21:9. Translated to pixels using imageSize: api.openai.com only accepts 1024x1024/1536x1024/1024x1536 (so 4:3 becomes 3:2), while exact-size relays keep the real ratio (4:3 = 1024x768 at 1K). Uses the model's saved default when omitted. Edits preserve the input image's framing and size, so aspectRatio is not sent for edits.",
+  })),
+  size: Type.Optional(Type.String({
+    description: "Exact output pixels as WIDTHxHEIGHT, for example 1536x640 or 2048x2048. Overrides aspectRatio. Requires an OpenAI-compatible model configured with sizeMode \"any\" (relays such as gemini-web2api): both sides must be multiples of 16, the ratio between 1:3 and 3:1, long side at most 3840 and short side at most 2160. Not sent for edits.",
   })),
   imageSize: Type.Optional(Type.String({
-    description: "Image resolution: 1K (1024x1024, default), 2K, 4K. Uses the model's saved default when omitted. Provider-dependent.",
+    description: "Resolution tier: 1K (default), 2K, 4K. Gemini/Imagen models receive it as imageConfig.imageSize. OpenAI-compatible relays with sizeMode \"any\" scale the ratio's baseline size by 1x/2x/4x and clamp to the relay limits (4:3 is 1024x768 at 1K, 2048x1536 at 2K, 2880x2160 at 4K). api.openai.com (sizeMode \"openai\") ignores it. Uses the model's saved default when omitted.",
   })),
   quality: Type.Optional(Type.String({
     description: "Image quality: auto (default), low, medium, high. Sent for gpt-image/DALL-E models.",
@@ -2591,7 +2675,7 @@ async function askImageOptions(
   if (aspect === undefined) return undefined;
 
   let defaultImageSize: string | undefined;
-  if (api === "google-generative-ai-image") {
+  {
     const sizeOptions: SelectOption<string | null>[] = [
       { label: "Not set — use the model default (1K)", value: null },
       { label: "1K", value: "1K" },
@@ -2605,7 +2689,9 @@ async function askImageOptions(
       ai: {
         kind: "size",
         field: "defaultImageSize",
-        guidance: "Gemini/Imagen resolution hint. Use null to keep the model default (1K).",
+        guidance: api === "openai-images"
+          ? "Only relays configured with sizeMode \"any\" honour this: 1K/2K/4K scale the ratio's exact size (4:3 → 1024x768/2048x1536/2880x2160). api.openai.com ignores it. Use null to keep the default (1K)."
+          : "Gemini/Imagen resolution hint. Use null to keep the model default (1K).",
         context: aiContextForOptions(context, partial()),
       },
     });
@@ -3202,9 +3288,7 @@ async function editFlow(
           ]
         : []),
       { label: `Default aspect ratio: ${options.defaultAspectRatio ?? "not set"}`, value: "aspect" },
-      ...(options.api === "google-generative-ai-image"
-        ? [{ label: `Default image size: ${options.defaultImageSize ?? "not set"}`, value: "size" }]
-        : []),
+      { label: `Default image size: ${options.defaultImageSize ?? "not set"}`, value: "size" },
       { label: `Provider base URL: ${providerBaseUrl || "not set"}`, value: "baseUrl" },
       { label: `Provider default API: ${providerApi}`, value: "providerApi" },
       { label: `Provider API key: ${providerApiKey ? "set" : "not set"}`, value: "apiKey" },
@@ -3373,7 +3457,9 @@ async function editFlow(
           ai: {
             kind: "size",
             field: "defaultImageSize",
-            guidance: "Gemini/Imagen resolution hint. Use null to keep the model default (1K).",
+            guidance: options.api === "openai-images"
+              ? "Only relays configured with sizeMode \"any\" honour this: 1K/2K/4K scale the ratio's exact size. api.openai.com ignores it. Use null to keep the default (1K)."
+              : "Gemini/Imagen resolution hint. Use null to keep the model default (1K).",
             context: aiContext(),
           },
         });
@@ -3795,6 +3881,7 @@ export default function piImageGen(pi: ExtensionAPI) {
     label: "Generate image",
     description:
       "Generate an image from a text prompt, or edit a local input image when imagePath is supplied. Uses the selected image model, which is independent of Pi's current text model. " +
+      "Output framing comes from aspectRatio (ratio preset) plus imageSize (1K/2K/4K tier); pass size as WIDTHxHEIGHT only when exact pixels are required and the model is an OpenAI-compatible relay that accepts arbitrary sizes. " +
       "When imagePath is supplied without maskPath in interactive TUI mode, the tool first asks whether to launch a region selector. If chosen, it opens a browser canvas for freehand lasso drawing; the user can also choose the whole image or cancel. In interactive TUI mode, every edit then opens a single prompt editor prefilled with the agent's prompt, so the user can confirm or replace it before the request is sent. Edits preserve the input image's framing and resolution. " +
       "Pass maskPath only when a mask was already prepared. Do NOT pass provider or model parameters — just provide the prompt and optional imagePath.",
     parameters: TOOL_PARAMS,
@@ -3812,6 +3899,7 @@ export default function piImageGen(pi: ExtensionAPI) {
       let aspectRatio = params.aspectRatio || imageModel.defaultAspectRatio || "1:1";
       const imageSize = params.imageSize || imageModel.defaultImageSize || "1K";
       const quality = params.quality || "auto";
+      const exactSizeInput = params.size?.trim() || undefined;
       let prompt = params.prompt;
 
       const hasEditInput = Boolean(params.imagePath || params.maskPath);
@@ -3885,8 +3973,8 @@ export default function piImageGen(pi: ExtensionAPI) {
         }
       }
 
-      if (inputImage && params.aspectRatio) {
-        editNotice = "Edits preserve the source image framing and size; aspectRatio applies to generation only.";
+      if (inputImage && (params.aspectRatio || exactSizeInput)) {
+        editNotice = "Edits preserve the source image framing and size; aspectRatio/size apply to generation only.";
       }
       if (inputImage) validateEditInputs(inputImage, maskImage);
 
@@ -3956,6 +4044,24 @@ export default function piImageGen(pi: ExtensionAPI) {
       });
 
       const providerConfig = await resolveProviderConfig(imageModel, ctx, config);
+      // `size` is an exact pixel request: only relays that accept arbitrary WxH
+      // can honour it, and edits keep the source size, so it never applies there.
+      let exactSize: string | undefined;
+      if (exactSizeInput && !inputImage) {
+        if (imageModel.api !== "openai-images") {
+          throw new Error(
+            `size is only supported by OpenAI-compatible image models; ${imageModel.provider}/${imageModel.id} uses ${imageModel.api}. Use aspectRatio and imageSize instead.`,
+          );
+        }
+        if (providerConfig.sizeMode === "openai") {
+          throw new Error(
+            `size is not supported by ${imageModel.provider}/${imageModel.id}: api.openai.com only accepts 1024x1024, 1536x1024 and 1024x1536. ` +
+            `Set sizeMode: "any" for a relay that accepts arbitrary WxH, or use aspectRatio instead.`,
+          );
+        }
+        exactSize = normalizeRequestedSize(exactSizeInput);
+      }
+
       const image = await generateImage(
         providerConfig,
         imageModel,
@@ -3963,6 +4069,7 @@ export default function piImageGen(pi: ExtensionAPI) {
         aspectRatio,
         imageSize,
         quality,
+        exactSize,
         inputImage,
         maskImage,
         combinedSignal,
@@ -3985,7 +4092,23 @@ export default function piImageGen(pi: ExtensionAPI) {
       const summary: string[] = [
         `${inputImage ? "Edited" : "Generated"} image with ${imageModel.provider}/${imageModel.id} (${imageModel.api}).`,
       ];
-      if (!inputImage) summary.push(`Aspect ratio: ${aspectRatio}.`);
+      if (!inputImage) {
+        const resolvedSize = exactSize
+          ?? (imageModel.api === "openai-images"
+            ? openAISizeFor(aspectRatio, providerConfig.sizeMode, imageSize)
+            : undefined);
+        if (exactSize) {
+          summary.push(params.aspectRatio
+            ? `size ${exactSize} overrides aspectRatio ${params.aspectRatio}.`
+            : `Requested size: ${exactSize}.`);
+        } else {
+          summary.push(`Aspect ratio: ${aspectRatio}.`);
+          if (resolvedSize) summary.push(`Requested size: ${resolvedSize}.`);
+        }
+        if (imageModel.api === "openai-images" && providerConfig.sizeMode === "openai" && params.imageSize) {
+          summary.push("imageSize is ignored: api.openai.com only accepts 1024x1024, 1536x1024 and 1024x1536.");
+        }
+      }
       if (inputDimensions) {
         summary.push(`Input size: ${inputDimensions.widthPx}x${inputDimensions.heightPx}.`);
       }
@@ -4023,6 +4146,10 @@ export default function piImageGen(pi: ExtensionAPI) {
           operation: inputImage ? "edit" : "generate",
           aspectRatio: inputImage ? undefined : aspectRatio,
           requestedAspectRatio: params.aspectRatio,
+          requestedSize: exactSize ?? (inputImage || imageModel.api !== "openai-images"
+            ? undefined
+            : openAISizeFor(aspectRatio, providerConfig.sizeMode, imageSize)),
+          requestedImageSize: params.imageSize,
           inputSize: inputDimensions ? `${inputDimensions.widthPx}x${inputDimensions.heightPx}` : undefined,
           responseSize: image.responseSize,
           outputFormat: image.outputFormat,

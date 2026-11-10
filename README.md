@@ -17,7 +17,7 @@ Image generation extension for [pi](https://github.com/badlogic/pi-mono). Adds a
 - 🧾 **JSON mode** — press `j` to edit the whole global settings file in a multi-line editor
 - 🔌 **Any OpenAI-compatible relay** — point `baseUrl` at it and use the `openai-images` API type
 - ⚙️ **Custom providers** — Point at any compatible API via settings files
-- 🖼️ **Aspect ratios & resolution** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` maps to Gemini's 1K/2K/4K tiers
+- 🖼️ **Aspect ratios, resolution tiers & exact pixels** — `aspectRatio` maps to `size` (OpenAI), `imageConfig` (Gemini), or `parameters.aspectRatio` (Imagen); `imageSize` chooses 1K/2K/4K (Gemini `imageConfig.imageSize`, plus 1x/2x/4x scaling on relays that accept arbitrary sizes); `size: "WIDTHxHEIGHT"` requests exact pixels
 - 💾 **Flexible save modes** — Project-local, global, or custom directory
 - 🎯 **`/image-model` command** — search/list focus, keyboard shortcuts, per-model options, and session persistence
 - 🖱️ **Interactive editing** — The edit flow first asks whether to select a region, then launches the browser freehand lasso tool; after selection, confirm or edit the prefilled prompt
@@ -229,8 +229,8 @@ Define image providers in `~/.pi/agent/settings/pi-image-gen.json[c]` (global) o
 
 Model entries accept `responseFormat`, `sizeMode`, `supportsEdit`, `defaultAspectRatio` and `defaultImageSize`; `api` can be set per model to override the provider. `sizeMode` controls how `aspectRatio` maps to the OpenAI Images `size` field:
 
-- `openai` — only `1024x1024`, `1536x1024`, `1024x1536`, matching `api.openai.com`; other ratios are rounded.
-- `any` — exact-ratio dimensions such as `1024x768` (4:3) and `1344x576` (21:9), for servers that accept arbitrary `WxH`.
+- `openai` — only `1024x1024`, `1536x1024`, `1024x1536`, matching `api.openai.com`; other ratios are rounded and `imageSize` is ignored.
+- `any` — exact-ratio dimensions such as `1024x768` (4:3) and `1344x576` (21:9), for servers that accept arbitrary `WxH`. `imageSize` scales that baseline by 1x/2x/4x and clamps it to the relay limits (long side ≤ 3840px, short side ≤ 2160px, both multiples of 16), so 4:3 becomes `2048x1536` at 2K and `2880x2160` at 4K. `size` can bypass the ratio table entirely.
 
 Custom providers default to `any`; the built-in `openai` provider defaults to `openai`. `responseFormat` defaults to `b64_json`; set it to `url` only when the provider returns URLs the downloader supports. The extension also accepts a server-owned `data:image/...;base64,...` URL and saves it directly without making a second request.
 
@@ -240,6 +240,7 @@ Custom providers default to `any`; the built-in `openai` provider defaults to `o
 
 - `response_format=url` is rejected; the proxy returns `b64_json` only. The extension defaults to `b64_json`.
 - `size` is applied to the final image. The extension deliberately omits `size` from **edit** requests, because a masked edit is composited back into the source image; sending a size would center-crop or downscale that composite and can trip the proxy's framing gate. Edits keep the input image's framing and resolution. `size` is still sent for generation.
+- The proxy validates `size` as `WIDTHxHEIGHT` (multiples of 16, ratio 1:3–3:1, long side ≤ 3840px, short side ≤ 2160px) and resize-crops the result to exactly those pixels with ImageMagick. With `sizeMode: "any"` the extension uses that to honour `imageSize` tiers and the tool's `size` parameter; without ImageMagick the proxy returns its native size instead.
 - Errors use the OpenAI `ErrorResponse` shape. The extension surfaces `type`, `code`, `param`, and `x-request-id` in the error text.
 - The proxy's default `image_request_budget_sec` is 900 seconds; the extension's request timeout defaults to 900 seconds to match.
 
@@ -290,12 +291,42 @@ The `generate_image` tool accepts:
 | `prompt` | string | *required* | Description of the image to generate or edit. In interactive TUI edits, the prompt editor is prefilled with this value; confirm it or replace it before the request is sent |
 | `imagePath` | string | — | Local input image path or `file://` URL; uses `/v1/images/edits` with an `openai-images` model. In interactive TUI, omit `maskPath` and the tool first asks whether to select an edit area |
 | `maskPath` | string | — | Optional prepared mask path or `file://` URL for localized edits; requires `imagePath`. Must be a PNG with an alpha channel and the same dimensions as the input image (transparent = editable). Omit to be asked whether to select interactively |
-| `aspectRatio` | string | configured default, else `1:1` for generation | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. Not sent for edits; edits preserve the input framing and size |
-| `imageSize` | string | configured default, else `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; the OpenAI Images API has no equivalent and ignores it |
+| `aspectRatio` | string | configured default, else `1:1` for generation | `1:1`, `2:3`, `3:2`, `3:4`, `4:3`, `4:5`, `5:4`, `9:16`, `16:9`, `21:9`. Translated to pixels together with `imageSize`; not sent for edits, which preserve the input framing and size |
+| `size` | string | — | Exact output pixels as `WIDTHxHEIGHT`, e.g. `1536x640`. Overrides `aspectRatio`. Only for OpenAI-compatible models with `sizeMode: "any"`; both sides must be multiples of 16, the ratio 1:3–3:1, long side ≤ 3840px, short side ≤ 2160px. Not sent for edits |
+| `imageSize` | string | configured default, else `1K` | `1K`, `2K`, `4K` — sent as Gemini `imageConfig.imageSize`; on `sizeMode: "any"` relays it scales the ratio's exact size by 1x/2x/4x (clamped to the relay limits); `api.openai.com` ignores it |
 | `quality` | string | `auto` | `auto`, `low`, `medium`, `high` (OpenAI direct only) |
 | `save` | string | `project` | `project`, `global`, or `custom`; images are always saved locally |
 | `saveDir` | string | — | Directory for `save=custom` |
 | `timeout` | number | `900` | Request timeout in seconds; matches gemini-web2api's default `image_request_budget_sec`. Browser mask selection is capped at 600 seconds |
+
+### Resolution and exact sizes
+
+`aspectRatio` picks the framing, `imageSize` picks the resolution tier. Together they resolve to concrete pixels before the request is sent:
+
+| `aspectRatio` | 1K (default) | 2K | 4K |
+|---|---|---|---|
+| `1:1` | `1024x1024` | `2048x2048` | `2160x2160` |
+| `16:9` | `1536x864` | `3072x1728` | `3840x2160` |
+| `9:16` | `864x1536` | `1728x3072` | `2160x3840` |
+| `4:3` | `1024x768` | `2048x1536` | `2880x2160` |
+| `3:4` | `768x1024` | `1536x2048` | `2160x2880` |
+| `3:2` | `1536x1024` | `3072x2048` | `3248x2160` |
+| `2:3` | `1024x1536` | `2048x3072` | `2160x3248` |
+| `5:4` | `1280x1024` | `2560x2048` | `2704x2160` |
+| `4:5` | `1024x1280` | `2048x2560` | `2160x2704` |
+| `21:9` | `1344x576` | `2688x1152` | `3840x1648` |
+
+The table applies to OpenAI-compatible models with `sizeMode: "any"` (the default for custom providers, e.g. `gemini-web2api`), which resize-crop to exactly these dimensions. Models with `sizeMode: "openai"` (including `api.openai.com`) only accept `1024x1024`, `1536x1024` and `1024x1536`, so ratios are rounded (`4:3` becomes `3:2`) and `imageSize` is ignored. Gemini models receive `aspectRatio` plus the `1K`/`2K`/`4K` tier and Google chooses the pixels; Imagen accepts only `1:1`, `3:4`, `4:3`, `9:16`, `16:9`, and other ratios fall back to the model default.
+
+For pixel-exact output on a relay that accepts arbitrary sizes, pass `size` instead of `aspectRatio`:
+
+```text
+> Generate a 1536x640 site banner
+```
+
+Here the agent calls `generate_image` with `size: "1536x640"`; the extension sends `"size": "1536x640"` and ignores `aspectRatio`.
+
+Values are validated locally before the request: multiples of 16, ratio between 1:3 and 3:1, long side ≤ 3840px and short side ≤ 2160px (the limits `gemini-web2api` enforces). The result summary reports both the requested size and the `size` the server says it produced.
 
 ## Pi Integration
 
